@@ -20,7 +20,7 @@
 
 `▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
 
-**Outsider (`ous`)** is an automated source-to-archive build engine designed specifically for the **Cudane** Linux ecosystem (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into `.xcs` binary packages, and automatically writes a unified **`index.json`** for your own repository of packages (with auto-updating support).
+**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for the **Cudane** Linux ecosystem (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into `.xcs` binary packages, and automatically writes a unified **`index.json`** for your own repository of packages (with auto-updating support).
 
 `▐▄` `-` `▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▌`
 

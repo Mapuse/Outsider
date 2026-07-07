@@ -587,13 +587,13 @@ fn normalize(lib: &str) -> Vec<String> {
 
 fn mltp(repo_root: &Path) -> Result<HashMap<String, Vec<String>>> {
     let mut library_packages: HashMap<String, Vec<String>> = HashMap::new();
-    let rline_root = repo_root.join(".os");
+    let ous_root = repo_root.join(".os");
 
-    if !rline_root.exists() {
+    if !ous_root.exists() {
         return Ok(library_packages);
     }
 
-    if let Ok(entries) = fs::read_dir(&rline_root) {
+    if let Ok(entries) = fs::read_dir(&ous_root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -782,7 +782,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     let work_dir = current_dir.join(format!(".os/{}", pkg.name));
     let src_dir = work_dir.join("src");
     let pkg_root = work_dir.join("pkg");
-    let state_path = work_dir.join(".rline_state.json");
+    let state_path = work_dir.join(".state.json");
     let build_log_path = work_dir.join("build_log.txt");
     let sum_path = work_dir.join("checksums.json");
 

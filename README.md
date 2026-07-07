@@ -932,7 +932,7 @@ The `.xcs` extension is a convention used by Cudane for `.xcs` Packages compress
 
 ### State File
 
-Each package's workspace contains a state file at `.ous/{package_name}/.rline_state.json`:
+Each package's workspace contains a state file at `.ous/{package_name}/.state.json`:
 
 ```rust
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -954,7 +954,7 @@ The following step identifiers are tracked:
 
 ### Resume Flow
 
-1. When `process()` starts, it checks for `.rline_state.json` in the package workspace.
+1. When `process()` starts, it checks for `.state.json` in the package workspace.
 2. If the file exists and `OUS_CLEAN` is **not** set, the state is loaded and only steps **not** in `completed_steps` are executed.
 3. After each successful step, the state file is updated atomically (written via `serde_json` + `fs::write`).
 4. Intermediate outputs are persisted:
@@ -994,12 +994,12 @@ This is the main orchestrator function that ties together the entire build pipel
 3. **Workspace directory setup**: The workspace is at `.ous/{package_name}`. Inside this:
     - `src/` — Where source code is fetched and built.
     - `pkg/` — Where installed artifacts are staged before archiving.
-    - `.rline_state.json` — State file tracking completed build steps (see [Build / Resume]).
+    - `.state.json` — State file tracking completed build steps (see [Build / Resume]).
     - `build_log.txt` — Persisted build log for dependency re-scanning on resume.
     - `checksums.json` — Persisted checksum results for resume.
 
 4. **State loading / workspace initialization**:
-    - If `OUS_CLEAN` is set **or** no `.rline_state.json` exists: the workspace is deleted and created fresh.
+    - If `OUS_CLEAN` is set **or** no `.state.json` exists: the workspace is deleted and created fresh.
     - Otherwise: the existing state file is loaded, and only incomplete steps are re-executed.
 
 5. **Source fetch**: `fetch(&pkg.source, src_str)` is called to populate the `src/` directory if the `fetch` step is not marked complete. If the step was already completed (from a previous partial run), it is skipped.
@@ -1022,7 +1022,7 @@ This is the main orchestrator function that ties together the entire build pipel
 
 12. **Archiving**: `archive(root_str, &final_path)` compresses the staging directory into the final `.xcs` file.
 
-13. **State finalization**: After archiving, all steps are marked complete in `.rline_state.json`. The next run will find the `.xcs` file and short-circuit.
+13. **State finalization**: After archiving, all steps are marked complete in `.state.json`. The next run will find the `.xcs` file and short-circuit.
 
 </details>
 
@@ -1333,7 +1333,7 @@ This prints:
 
 2. **Short-Circuit Check**: `process()` checks if the output file `<name>-<version>.xcs` already exists in the output directory. If it does and `OUS_FORCE` is not set, the package is skipped entirely — no fetch, build, or archive operations occur.
 
-3. **State Loading**: `process()` checks for `.ous/<package_name>/.rline_state.json`. If found and `OUS_CLEAN` is not set, the state is loaded and completed steps are skipped. If `OUS_CLEAN` is set or no state file exists, the workspace is created fresh.
+3. **State Loading**: `process()` checks for `.ous/<package_name>/.state.json`. If found and `OUS_CLEAN` is not set, the state is loaded and completed steps are skipped. If `OUS_CLEAN` is set or no state file exists, the workspace is created fresh.
 
 4. **Source Fetching** (conditional): If the `fetch` step is not marked complete in the state file, `fetch()` retrieves the source code into `src/` using the appropriate method (local copy, git clone, or curl+tar download). On success, the state file is updated.
 
@@ -1357,7 +1357,7 @@ This prints:
 
 10. **Archiving** (conditional): If the `archive` step is not marked complete, `archive()` compresses the `pkg/` directory into `<name>-<version>.xcs` using `tar` with Zstandard compression.
 
-11. **State Finalization**: After archiving, all steps are marked complete in `.rline_state.json`. The next invocation will find the `.xcs` and skip the entire pipeline.
+11. **State Finalization**: After archiving, all steps are marked complete in `.state.json`. The next invocation will find the `.xcs` and skip the entire pipeline.
 
 </details>
 

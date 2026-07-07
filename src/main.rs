@@ -3,7 +3,7 @@ pub mod utils;
 use crate::utils::ui::UserInterface;
 
 use anyhow::{anyhow, Result};
-use os::{process, Manifest, PackageMetadata};
+use ous::{process, Manifest, PackageMetadata};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let mut output_dir = String::new();
 
     if args.len() == 0 {
-        utils::UserInterface::info("Usage: os [OPTIONS] <MANIFEST> <OUTPUT_DIR>\nTry 'os --help' for more information.");
+        utils::UserInterface::info("Usage: ous [OPTIONS] <MANIFEST> <OUTPUT_DIR>\nTry 'ous --help' for more information.");
         sys_process::exit(1);
     }
 
@@ -24,7 +24,7 @@ fn main() -> Result<()> {
             "-h" | "--help" => {
                 println!("Render Line (Outsider) Build Engine\n");
                 utils::UserInterface::info("USAGE:");
-                println!("  os [OPTIONS] <MANIFEST> <OUTPUT_DIR>\n");
+                println!("  ous [OPTIONS] <MANIFEST> <OUTPUT_DIR>\n");
                 utils::UserInterface::info("OPTIONS:");
                 println!("  -a, --archive <SRC> <OUT>  Manually archive a directory using tar.zstd (.xcs)");
                 println!("  -x, --extract <PKG> <DEST> Extract standalone package(s) into target rootfs");
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
                 let staging_dir = args.next().into_iter().next().unwrap_or_default();
                 let output_package = args.next().into_iter().next().unwrap_or_default();
                 if staging_dir.is_empty() || output_package.is_empty() {
-                    UserInterface::error(&format!("Usage: os -a <staging_dir> <output_package.xcs>"));
+                    UserInterface::error(&format!("Usage: ous -a <staging_dir> <output_package.xcs>"));
                     sys_process::exit(1);
                 }
                 let status = sys_process::Command::new("sh")
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
                 let input_package = args.next().into_iter().next().unwrap_or_default();
                 let root = args.next().into_iter().next().unwrap_or_default();
                 if input_package.is_empty() || root.is_empty() {
-                    UserInterface::error(&format!("Usage: os -x <package.xcs|directory> <root>"));
+                    UserInterface::error(&format!("Usage: ous -x <package.xcs|directory> <root>"));
                     sys_process::exit(1);
                 }
                 fs::create_dir_all(&root)?;
@@ -105,16 +105,16 @@ fn main() -> Result<()> {
                 let src_dir = args.next().into_iter().next().unwrap_or_default();
                 let dest_dir = args.next().into_iter().next().unwrap_or_default();
                 if src_dir.is_empty() || dest_dir.is_empty() {
-                    UserInterface::error(&format!("Usage: os -w <src_dir> <dest_dir>"));
+                    UserInterface::error(&format!("Usage: ous -w <src_dir> <dest_dir>"));
                     sys_process::exit(1);
                 }
                 let mut pkg_name = "custom-package".to_string();
                 if let Some(name) = Path::new(&src_dir).file_name() {
                     pkg_name = name.to_string_lossy().into_owned();
                 }
-                let sum = os::hash(&dest_dir).unwrap_or_default();
+                let sum = ous::hash(&dest_dir).unwrap_or_default();
                 let repo_root = env::current_dir()?;
-                let mock_pkg = os::Package {
+                let mock_pkg = ous::Package {
                     name: pkg_name.clone(),
                     version: "manual".into(),
                     source: "manual".into(),
@@ -124,7 +124,7 @@ fn main() -> Result<()> {
                     links: None,
                 };
                 
-                let metadata = match os::mtd(&mock_pkg, &dest_dir, &sum, &src_dir, "", &repo_root) {
+                let metadata = match ous::mtd(&mock_pkg, &dest_dir, &sum, &src_dir, "", &repo_root) {
                     Ok(meta) => meta,
                     Err(_) => PackageMetadata {
                         pkg_name,
@@ -139,7 +139,7 @@ fn main() -> Result<()> {
                     }
                 };
 
-                os::write(&metadata, &dest_dir)?;
+                ous::write(&metadata, &dest_dir)?;
                 UserInterface::success(&format!("Successfully generated metadata.json inside {}", dest_dir));
                 sys_process::exit(0);
             }
@@ -180,14 +180,14 @@ fn main() -> Result<()> {
                 println!("\n--- Integrity & Checksum Verification ---");
                 let file = fs::File::open(path_obj)?;
                 
-                let mut embedded: Vec<os::Checksum> = Vec::new();
+                let mut embedded: Vec<ous::Checksum> = Vec::new();
                 if let Ok(decoder) = zstd::stream::Decoder::new(file) {
                     let mut archive = tar::Archive::new(decoder);
                     if let Ok(entries) = archive.entries() {
                         for entry in entries.flatten() {
                             if let Ok(path) = entry.path() {
                                 if path.file_name().map_or(false, |n| n == "metadata.json") {
-                                    if let Ok(meta_struct) = serde_json::from_reader::<_, os::PackageMetadata>(entry) {
+                                    if let Ok(meta_struct) = serde_json::from_reader::<_, ous::PackageMetadata>(entry) {
                                         embedded = vec![meta_struct.checksum];
                                         break;
                                     }
@@ -198,7 +198,7 @@ fn main() -> Result<()> {
                 }
 
                 let _file = fs::File::open(path_obj)?;
-                let current_checksums = os::hash(path_obj.to_str().unwrap_or_default())
+                let current_checksums = ous::hash(path_obj.to_str().unwrap_or_default())
                     .unwrap_or_default();
 
                 if embedded.is_empty() {
@@ -302,7 +302,7 @@ fn main() -> Result<()> {
 
     if manifest_path.is_empty() || output_dir.is_empty() {
         UserInterface::error("Manifest and Output directory are required.");
-        UserInterface::info("Usage: os [OPTIONS] <MANIFEST> <OUTPUT_DIR>\nTry 'os --help' for more information.");
+        UserInterface::info("Usage: ous [OPTIONS] <MANIFEST> <OUTPUT_DIR>\nTry 'ous --help' for more information.");
         sys_process::exit(1);
     }
 

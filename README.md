@@ -551,7 +551,14 @@ cargo build --release
 If you are on Cudane:
 
 ```shell
-cargo +nightly -Zjson-target-spec -Zbuild-std build --release --target x86_64-pc-linux-musl.json
+# 1. Install nightly:
+rustup toolchain install nightly
+
+# 2. Add the nightly toolchain library for rust-src:
+rustup component add rust-src --toolchain nightly
+
+# 3. Build:
+rustup run nightly cargo -Zjson-target-spec -Zbuild-std build --release --target x86_64-pc-linux-musl.json
 ```
 
 Run with a manifest and an output directory:

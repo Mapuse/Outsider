@@ -122,6 +122,7 @@ fn main() -> Result<()> {
                     build_cmd: "".into(),
                     install_cmd: "".into(),
                     links: None,
+                    arch: "native".into(),
                 };
                 
                 let metadata = match ous::mtd(&mock_pkg, &dest_dir, &sum, &src_dir, "", &repo_root) {
@@ -131,6 +132,7 @@ fn main() -> Result<()> {
                         version: "manual".into(),
                         source: "manual".into(),
                         license: "Unknown".into(),
+                        arch: "unknown".into(),
                         checksum: sum[0].clone(),
                         dependencies: Vec::new(),
                         files: Vec::new(),

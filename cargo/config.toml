@@ -13,3 +13,19 @@ rustflags = [
     "-C", "link-arg=-flto=full",
     "-C", "link-arg=--sysroot=/system"
 ]
+
+[target.aarch64-unknown-linux-musl]
+linker = "clang"
+rustflags = [
+    "-C", "target-cpu=armv8-a",
+    "-C", "opt-level=3",
+    "-C", "lto=fat",
+    "-C", "codegen-units=1",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-target",
+    "-C", "link-arg=aarch64-unknown-linux-musl",
+    "-C", "link-arg=-march=armv8-a",
+    "-C", "link-arg=-O3",
+    "-C", "link-arg=-flto=full",
+    "-C", "link-arg=--sysroot=/system"
+]

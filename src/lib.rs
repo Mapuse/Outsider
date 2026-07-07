@@ -27,6 +27,12 @@ pub struct Package {
     pub build_cmd: String,
     pub install_cmd: String,
     pub links: Option<std::collections::HashMap<String, String>>,
+    #[serde(default = "default_arch")]
+    pub arch: String,
+}
+
+fn default_arch() -> String {
+    "native".into()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -49,6 +55,8 @@ pub struct PackageMetadata {
     pub version: String,
     pub license: String,
     pub source: String,
+    #[serde(default)]
+    pub arch: String,
     pub checksum: Checksum,
     pub dependencies: Vec<Dependency>,
     pub files: Vec<PathBuf>,
@@ -164,9 +172,14 @@ pub fn build(pkg: &Package, dir: &str) -> Result<String> {
         }
 
         if pkg.build_type == "rust" {
-            UserInterface::info("Running automatic static musl cargo build...");
+            let target = env::var("OUS_TARGET").unwrap_or_else(|_| "x86_64-pc-linux-musl".to_string());
+            let cpu = if target.contains("aarch64") { "armv8-a" } else { "x86-64-v3" };
+            UserInterface::info(&format!("Running automatic cargo build for {target}..."));
+            let cmd = format!(
+                "RUSTFLAGS=\"-C linker=clang -C target-cpu={cpu} -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+crt-static -C link-arg=-target -C link-arg={target} -C link-arg=-march={cpu} -C link-arg=-O3 -C link-arg=-flto=full -C link-arg=--sysroot=/system\" cargo build --release --target {target} 2>&1 | tee capture.log"
+            );
             let out = Command::new("sh")
-                .args(["-c", "RUSTFLAGS=\"-C linker=clang -C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+crt-static -C link-arg=-target -C link-arg=x86_64-pc-linux-musl -C link-arg=-march=x86-64-v3 -C link-arg=-O3 -C link-arg=-flto=full -C link-arg=--sysroot=/system\" cargo build --release --target x86_64-pc-linux-musl 2>&1 | tee capture.log"])
+                .args(["-c", &cmd])
                 .current_dir(dir)
                 .output()?;
             let log_content = String::from_utf8_lossy(&out.stdout).to_string();
@@ -702,6 +715,7 @@ pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_conte
         version: pkg.version.clone(),
         license: license(src_dir),
         source: pkg.source.clone(),
+        arch: pkg.arch.clone(),
         checksum: selected,
         dependencies,
         files: files.into_iter().map(PathBuf::from).collect(),
@@ -724,7 +738,12 @@ pub fn write(meta: &PackageMetadata, dest: &str) -> Result<()> {
 }
 
 pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
-    let index_path = Path::new(index_root).join("index.json");
+    let index_name = if meta.arch.is_empty() || meta.arch == "native" {
+        "index.json".to_string()
+    } else {
+        format!("index.{}.json", meta.arch)
+    };
+    let index_path = Path::new(index_root).join(index_name);
     fs::create_dir_all(index_root)?;
 
     let mut entries: Vec<PackageMetadata> = if index_path.exists() {
@@ -779,7 +798,12 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         return Ok(final_path);
     }
 
-    let work_dir = current_dir.join(format!(".os/{}", pkg.name));
+    let arch_dir = if pkg.arch.is_empty() || pkg.arch == "native" {
+        pkg.name.clone()
+    } else {
+        format!("{}/{}", pkg.name, pkg.arch)
+    };
+    let work_dir = current_dir.join(format!(".os/{}", arch_dir));
     let src_dir = work_dir.join("src");
     let pkg_root = work_dir.join("pkg");
     let state_path = work_dir.join(".state.json");

@@ -97,6 +97,7 @@ pub struct Package {
     pub build_cmd: String,
     pub install_cmd: String,
     pub links: Option<std::collections::HashMap<String, String>>,
+    pub arch: String,
 }
 ```
 
@@ -162,6 +163,10 @@ The shell command to install built artifacts into the staging directory. The beh
 - **If empty** (`""`) **and `build_type` is not `"rust"`**: Falls through to execute the empty string as a command (which would do nothing), then processes symlinks.
 - **If non-empty**: The command is executed via `sh -c` with the `CUDANE_DEST` environment variable set to the package staging directory path. The command runs with the source directory as its working directory. After the command completes, any symlinks in the `links` map are created.
 
+### arch (String)
+
+The target architecture for the package. Supports multi-arch builds — common values are `"amd64"`, `"arm64"`, or `"native"` (which means build for the host architecture). When omitted from the manifest, it defaults to `"native"` for backward compatibility. The architecture is propagated into the package metadata and can be used by downstream tools to select the correct package variant for a given target platform.
+
 ### links (Option<HashMap<String, String>>)
 
 An optional map of symbolic links to create inside the package staging directory after installation. The map keys are the **target** paths (what the symlink points to) and the values are the **link** paths (where the symlink is placed). For example:
@@ -203,6 +208,7 @@ pub struct PackageMetadata {
     pub version: String,
     pub license: String,
     pub source: String,
+    pub arch: String,
     pub checksum: Checksum,
     pub dependencies: Vec<Dependency>,
     pub files: Vec<PathBuf>,
@@ -216,6 +222,7 @@ Each field is populated as follows:
 - **`pkg_name`**: Mirrored directly from the manifest's `name` field.
 - **`version`**: Mirrored directly from the manifest's `version` field.
 - **`source`**: Mirrored directly from the manifest's `source` field.
+- **`arch`**: Mirrored directly from the manifest's `arch` field. Defaults to `""` when absent (backward compat with older metadata).
 - **`license`**: Determined by the `license()` function, which scans the source directory for license files and extracts the license name using regex pattern matching.
 - **`build_type`**: Mirrored directly from the manifest's `build_type` field.
 - **`build_date`**: An ISO 8601 UTC timestamp generated at runtime via `chrono::Utc::now().to_rfc3339()`, recording exactly when the metadata was created.
@@ -1122,6 +1129,58 @@ This design allows the index to be incrementally updated as new packages are bui
 
 </details>
 
+<details><summary id="multiarch">Multi-Architecture Pipeline</summary>
+
+`Outsider` supports building packages for multiple target architectures from a single manifest. The pipeline is driven by the `CUDANE_TARGETS` environment variable and the included `pipeline.sh` script.
+
+### Usage
+
+```shell
+export CUDANE_TARGETS="x86_64-pc-linux-musl,aarch64-unknown-linux-musl"
+./pipeline.sh manifest.json
+```
+
+For each target, the pipeline:
+
+1. Sets `OUS_TARGET` to the target triple, which is read by the engine's auto-build path to pass `--target <triple>` to `cargo`.
+2. Creates `output/<arch>/` for built `.xcs` packages.
+3. Writes `index.<arch>.json` with arch-specific package metadata.
+4. Moves packages into `pool/<arch>/<name>/` for organized storage.
+
+### Target Spec Files
+
+Rust `.json` target specs define the LLVM target, data layout, and linker for each architecture:
+
+| File | Architecture |
+| --- | --- |
+| `x86_64-pc-linux-musl.json` | amd64, x86-64-v3, musl |
+| `aarch64-unknown-linux-musl.json` | arm64, armv8-a, musl |
+
+To add a new architecture, create the target spec `.json` file and add its triple to `CUDANE_TARGETS`.
+
+### Cargo Configuration
+
+Each target has a corresponding section in `cargo/config.toml` with target-specific `rustflags`:
+
+```toml
+[target.x86_64-pc-linux-musl]
+linker = "clang"
+rustflags = ["-C", "target-cpu=x86-64-v3", ...]
+
+[target.aarch64-unknown-linux-musl]
+linker = "clang"
+rustflags = ["-C", "target-cpu=armv8-a", ...]
+```
+
+### Engine Integration
+
+- **`Package.arch`** — Set per-package in the manifest (defaults to `"native"` for backward compatibility).
+- **`OUS_TARGET`** — Environment variable read by the auto Rust build to determine the `--target` triple.
+- **Arch-aware workspace** — Each arch gets its own workspace at `.os/<pkg>/<arch>/` to avoid rebuild conflicts when building the same package for multiple architectures.
+- **Arch-specific index** — `index()` writes `index.<arch>.json` when the architecture is set, keeping per-arch metadata separate.
+
+</details>
+
 <details><summary id="requirements">Requirements</summary>
 
 Because `Outsider` delegates specialized operations to highly optimized system-level utilities, the build host must have the following tools installed and accessible in `$PATH`:
@@ -1171,9 +1230,11 @@ Make sure that you have been set up the `$DESTDIR` variable befor start building
 
 ### 3. Rust Architecture
 
-The architecture of Cudane is currently unavailable in Rust, so you have to use the integrated architecture instead, this file is extremly required if you're building a package that written in Rust specially for Cudane.
+Cudane's architecture is not shipped with Rust's built-in target definitions, so you must use the integrated target spec files. These JSON files define the LLVM target, data layout, and linker for each architecture. They are required when building Rust packages for Cudane.
 
-File: `/x86_64-pc-linux-musl.json` (`amd64`):
+#### x86_64 (amd64)
+
+File: `x86_64-pc-linux-musl.json`
 ```json
 {
   "arch": "x86_64",
@@ -1193,6 +1254,31 @@ File: `/x86_64-pc-linux-musl.json` (`amd64`):
   "vendor": "pc"
 }
 ```
+
+#### aarch64 (arm64)
+
+File: `aarch64-unknown-linux-musl.json`
+```json
+{
+  "arch": "aarch64",
+  "cpu": "armv8-a",
+  "data-layout": "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
+  "env": "musl",
+  "executables": true,
+  "linker": "clang",
+  "linker-flavor": "gnu-cc",
+  "llvm-target": "aarch64-unknown-linux-musl",
+  "max-atomic-width": 128,
+  "os": "linux",
+  "position-independent-executables": true,
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "target-pointer-width": "64",
+  "vendor": "unknown"
+}
+```
+
+The engine reads the `OUS_TARGET` environment variable to select which target spec to use during automatic Rust builds. Set it to the desired triple before invoking the engine, or use `pipeline.sh` with `CUDANE_TARGETS` for multi-arch builds.
 
 ### 4. Complete Toolchain Agility
 
@@ -1372,7 +1458,7 @@ This prints:
 
 ## The Unlicense
 
-see [**`LICENSE`**](https://codeberg.org/Cudane/Outsider/LICENSE) file for details.
+see [**`LICENSE`**](https://codeberg.org/Cudane/Outsider/src/branch/master/LICENSE) file for details.
 
 </details>
 

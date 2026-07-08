@@ -172,7 +172,7 @@ pub fn build(pkg: &Package, dir: &str) -> Result<String> {
         }
 
         if pkg.build_type == "rust" {
-            let target = env::var("OUS_TARGET").unwrap_or_else(|_| "x86_64-pc-linux-musl".to_string());
+            let target = env::var("OUS_TARGET").unwrap_or_else(|_| "x86_64-unknown-linux-musl".to_string());
             let cpu = if target.contains("aarch64") { "armv8-a" } else { "x86-64-v3" };
             UserInterface::info(&format!("Running automatic cargo build for {target}..."));
             let cmd = format!(

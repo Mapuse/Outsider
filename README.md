@@ -143,7 +143,7 @@ The shell command to execute for building the package. The behavior depends on t
 
 ```shell
 RUSTFLAGS="-C linker=clang -C link-arg=-target \
-  -C link-arg=x86_64-pc-linux-musl -C link-arg=--sysroot=/system \
+  -C link-arg=x86_64-unknown-linux-musl -C link-arg=--sysroot=/system \
   -C target-feature=+crt-static" \
   cargo build --target x86_64-unknown-linux-musl --release
 ```
@@ -555,17 +555,14 @@ Build the engine (GNU-based distributions):
 cargo build --release
 ```
 
-If you are on Cudane:
+With musl targets:
 
 ```shell
-# 1. Install nightly:
-rustup toolchain install nightly
+# 1. Add the musl target:
+rustup target add x86_64-unknown-linux-musl
 
-# 2. Add the nightly toolchain library for rust-src:
-rustup component add rust-src --toolchain nightly
-
-# 3. Build:
-rustup run nightly cargo -Zjson-target-spec -Zbuild-std build --release --target x86_64-pc-linux-musl.json
+# 2. Build:
+cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 Run with a manifest and an output directory:
@@ -756,7 +753,7 @@ This function executes the build command for a package and returns the captured 
 2. **Empty command with `OUS_NO_AUTO`**: If `build_cmd` is empty and the `OUS_NO_AUTO` environment variable is set, the function returns an empty string. This gives users explicit control to disable automatic behaviors.
 
 3. **Empty command with `build_type == "rust"`**: The automatic Rust build is triggered:
-    - The `RUSTFLAGS` environment variable is set to Cudane-specific values: linker is `clang`, target is `x86_64-pc-linux-musl`, sysroot is `/system`, and static CRT is enabled.
+    - The `RUSTFLAGS` environment variable is set to Cudane-specific values: linker is `clang`, target is `x86_64-unknown-linux-musl`, sysroot is `/system`, and static CRT is enabled.
     - `cargo build --target x86_64-unknown-linux-musl --release` is executed in the source directory.
     - Both stdout and stderr are captured into a single `log_content` string.
     - The log is written to `capture.log` in the source directory.
@@ -1136,7 +1133,7 @@ This design allows the index to be incrementally updated as new packages are bui
 ### Usage
 
 ```shell
-export CUDANE_TARGETS="x86_64-pc-linux-musl,aarch64-unknown-linux-musl"
+export CUDANE_TARGETS="x86_64-unknown-linux-musl,aarch64-unknown-linux-musl"
 ./pipeline.sh manifest.json
 ```
 
@@ -1147,23 +1144,23 @@ For each target, the pipeline:
 3. Writes `index.<arch>.json` with arch-specific package metadata.
 4. Moves packages into `pool/<arch>/<name>/` for organized storage.
 
-### Target Spec Files
+### Standard Rustup Targets
 
-Rust `.json` target specs define the LLVM target, data layout, and linker for each architecture:
+Outsider uses standard Rustup musl targets — no custom `.json` target specs required:
 
-| File | Architecture |
+| Target Triple | Architecture |
 | --- | --- |
-| `x86_64-pc-linux-musl.json` | amd64, x86-64-v3, musl |
-| `aarch64-unknown-linux-musl.json` | arm64, armv8-a, musl |
+| `x86_64-unknown-linux-musl` | amd64, x86-64-v3, musl |
+| `aarch64-unknown-linux-musl` | arm64, armv8-a, musl |
 
-To add a new architecture, create the target spec `.json` file and add its triple to `CUDANE_TARGETS`.
+Install them with `rustup target add <triple>`. To add a new architecture, install its target via rustup and add its triple to `CUDANE_TARGETS`.
 
 ### Cargo Configuration
 
 Each target has a corresponding section in `cargo/config.toml` with target-specific `rustflags`:
 
 ```toml
-[target.x86_64-pc-linux-musl]
+[target.x86_64-unknown-linux-musl]
 linker = "clang"
 rustflags = ["-C", "target-cpu=x86-64-v3", ...]
 
@@ -1215,11 +1212,11 @@ To protect system integrity and match Cudane custom root-directory paradigm, sof
 Cudane eliminates standard GCC assumptions in favor of a modern, strict LLVM and Clang foundation backed by the lightweight `musl` C library. Every source compilation command block initialized via a manifest must declare the tracking environment variables and direct cross-compilation target parameters:
 
 ```shell
-CC=\"clang --target x86_64-pc-linux-musl -march=x86-64-v3 -O3 -flto=full -static\" --sysroot=$DESTDIR/system
+CC=\"clang --target x86_64-unknown-linux-musl -march=x86-64-v3 -O3 -flto=full -static\" --sysroot=$DESTDIR/system
 ```
 
 * `CC="clang"`/`CXX="clang"`: Defines the primary compiler engine embedded with aggressive target constraints passed as an indivisible string:
-* `--target=x86_64-pc-linux-musl`: Mandates code generation tailored strictly to the highly performant `musl` C library runtime engine on standard PC architecture instead of standard `glibc`, passed as a single token with an equals sign (`=`) to prevent host flag reordering.
+* `--target=x86_64-unknown-linux-musl`: Mandates code generation tailored strictly to the highly performant `musl` C library runtime engine on standard PC architecture instead of standard `glibc`, passed as a single token with an equals sign (`=`) to prevent host flag reordering.
 * `-march=x86-64-v3`: Forces the compiler to exploit advanced microarchitecture extensions (including AVX, AVX2, BMI2, and SSE4.2), doubling general-purpose registers to eliminate memory spilling and maximize raw execution speed.
 * `-O3`: Activates aggressive compiler optimization loops, vectorizing mathematical operations and restructuring the binary layout for extreme runtime performance.
 * `-flto=full`: Enables full Link-Time Optimization across both compile and link phases, allowing LLVM to analyze the entire codebase as a single unit to eliminate dead code and aggressively debloat dependencies.
@@ -1228,59 +1225,16 @@ CC=\"clang --target x86_64-pc-linux-musl -march=x86-64-v3 -O3 -flto=full -static
 
 Make sure that you have been set up the `$DESTDIR` variable befor start building, see [[`Starting`](#starting)] section for more informations about setting the building variable.
 
-### 3. Rust Architecture
+### 3. Rust Targets
 
-Cudane's architecture is not shipped with Rust's built-in target definitions, so you must use the integrated target spec files. These JSON files define the LLVM target, data layout, and linker for each architecture. They are required when building Rust packages for Cudane.
+Cudane uses standard Rustup musl targets — no custom `.json` target spec files needed. Install them with:
 
-#### x86_64 (amd64)
-
-File: `x86_64-pc-linux-musl.json`
-```json
-{
-  "arch": "x86_64",
-  "cpu": "x86-64-v3",
-  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-  "env": "musl",
-  "executables": true,
-  "linker": "clang",
-  "linker-flavor": "gnu-cc",
-  "llvm-target": "x86_64-pc-linux-musl",
-  "max-atomic-width": 64,
-  "os": "linux",
-  "position-independent-executables": true,
-  "crt-static-default": true,
-  "crt-static-respected": true,
-  "target-family": ["unix"],
-  "target-pointer-width": "64",
-  "vendor": "pc"
-}
+```shell
+rustup target add x86_64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-musl
 ```
 
-#### aarch64 (arm64)
-
-File: `aarch64-unknown-linux-musl.json`
-```json
-{
-  "arch": "aarch64",
-  "cpu": "armv8-a",
-  "data-layout": "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128",
-  "env": "musl",
-  "executables": true,
-  "linker": "clang",
-  "linker-flavor": "gnu-cc",
-  "llvm-target": "aarch64-unknown-linux-musl",
-  "max-atomic-width": 128,
-  "os": "linux",
-  "position-independent-executables": true,
-  "crt-static-default": true,
-  "crt-static-respected": true,
-  "target-family": ["unix"],
-  "target-pointer-width": "64",
-  "vendor": "unknown"
-}
-```
-
-The engine reads the `OUS_TARGET` environment variable to select which target spec to use during automatic Rust builds. Set it to the desired triple before invoking the engine, or use `pipeline.sh` with `CUDANE_TARGETS` for multi-arch builds.
+The engine reads the `OUS_TARGET` environment variable to determine which `--target` triple to pass to `cargo` during automatic Rust builds. Set it before invoking the engine, or use `pipeline.sh` with `CUDANE_TARGETS` for multi-arch builds.
 
 ### 4. Complete Toolchain Agility
 
@@ -1475,6 +1429,6 @@ see [**`LICENSE`**](https://codeberg.org/Cudane/Outsider/src/branch/master/LICEN
 `▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
 
 - **`Version`:** **`0.5.0`**.
-- **`Architecture`:** **`x86_64-pc-linux-musl`** (**`amd64`**).
+- **`Architecture`:** **`x86_64-unknown-linux-musl`** (**`amd64`**).
 
 `▐▄` `-` `▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▌`

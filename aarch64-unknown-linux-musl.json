@@ -12,6 +12,7 @@
   "position-independent-executables": true,
   "crt-static-default": true,
   "crt-static-respected": true,
+  "target-family": ["unix"],
   "target-pointer-width": 64,
   "vendor": "unknown"
 }

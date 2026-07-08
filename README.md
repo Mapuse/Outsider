@@ -1250,6 +1250,7 @@ File: `x86_64-pc-linux-musl.json`
   "position-independent-executables": true,
   "crt-static-default": true,
   "crt-static-respected": true,
+  "target-family": ["unix"],
   "target-pointer-width": "64",
   "vendor": "pc"
 }
@@ -1273,6 +1274,7 @@ File: `aarch64-unknown-linux-musl.json`
   "position-independent-executables": true,
   "crt-static-default": true,
   "crt-static-respected": true,
+  "target-family": ["unix"],
   "target-pointer-width": "64",
   "vendor": "unknown"
 }

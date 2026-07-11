@@ -20,7 +20,7 @@
 
 `▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
 
-**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for the **Cudane** Linux ecosystem (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into `.xcs` binary packages, and automatically writes a unified **`index.json`** for your own repository of packages (with auto-updating support).
+**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for the **Cudane** Linux ecosystem (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into `.xcs` binary packages, and automatically writes per-architecture **`index.<arch>.json`** files for your own repository of packages (with auto-updating support).
 
 `▐▄` `-` `▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▌`
 
@@ -892,11 +892,11 @@ The `metadata.json` file becomes part of the package archive and can be read by 
 pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()>
 ```
 
-This function maintains a repository-wide index of all built packages. The index is stored as `index.json` in the output directory.
+This function maintains a per-architecture index of all built packages. The index is stored as `index.<arch>.json` in the output directory, where `<arch>` is the target architecture (e.g., `x86_64`, `aarch64`, or `native`).
 
 **Logic:**
 
-1. **Index file location**: The index is stored at `{index_root}/index.json`. The directory is created if it does not exist.
+1. **Index file location**: The index is stored at `{index_root}/index.<arch>.json`. The directory is created if it does not exist.
 
 2. **Existing index loading**: If the index file already exists, it is read and deserialized into a `Vec<PackageMetadata>`. If deserialization fails (for example, corrupted file), an empty vector is used as a fallback.
 
@@ -908,7 +908,7 @@ This function maintains a repository-wide index of all built packages. The index
 
 5. **Sorting**: The entries are sorted by `(pkg_name, version)` using `.sort_by()` with a tuple comparison. This ensures deterministic ordering in the index file.
 
-6. **Writing**: The sorted vector is serialized to pretty-printed JSON and written to `index.json`.
+6. **Writing**: The sorted vector is serialized to pretty-printed JSON and written to `index.<arch>.json`.
 
 This mechanism allows repository management tools to quickly discover all available packages and their versions without scanning individual `.xcs` files.
 
@@ -936,6 +936,68 @@ tar -c -C <dest> . | zstd -3 <out>
 1. If `tar` succeeds, the function returns `Ok(())`. Otherwise, it returns an error.
 
 The `.xcs` extension is a convention used by Cudane for `.xcs` Packages compressed with Zstandard. The `-noappend` flag ensures each build produces a clean, independent archive.
+
+The compression level defaults to `3` but can be overridden via `OUS_ZSTD_LEVEL` env var or `-z <NUM>` flag.
+
+## sort_packages - Pool Organization
+
+```rust
+pub fn sort_packages(dir: &str, arch: &str) -> Result<()>
+```
+
+Sorts `.xcs` files from a flat output directory into the per-architecture pool structure `pool/<arch>/<name>/`. Parses package names from filenames using the pattern `<name>-<version>.xcs`.
+
+**Usage:** `ous --sort output x86_64`
+
+## validate - Index Consistency Check
+
+```rust
+pub fn validate(index_path: &str, packages_dir: &str) -> Result<usize>
+```
+
+Validates that the index file and built `.xcs` packages are consistent. Returns the number of problems found (0 = all checks pass).
+
+**Checks performed:**
+1. Index is valid JSON and a flat array
+2. No duplicate package names
+3. All required fields present
+4. Every `.xcs` has a matching index entry
+5. Every index entry has a matching `.xcs`
+6. All `.xcs` files are valid zstd archives (magic bytes `28 B5 2F FD`)
+
+**Usage:** `ous --validate index.x86_64.json output/`
+
+## checksum_index - SHA-256 Checksums + URL Rewrite
+
+```rust
+pub fn checksum_index(index_path: &str, pkg_dir: &str, base_url: &str, arch: &str) -> Result<()>
+```
+
+Computes SHA-256 checksums for each `.xcs` file and updates the corresponding index entry. Simultaneously rewrites the `source` URL to point to the pool path: `<base_url>/pool/<arch>/<name>/<name>-<version>.xcs`.
+
+**Usage:** `ous --checksum index.x86_64.json pool/ --base-url https://raw.codeberg.org/Cudane/Repository --arch x86_64`
+
+## rewrite_source - URL Rewriting
+
+```rust
+pub fn rewrite_source(index_path: &str, base_url: &str, arch: &str) -> Result<()>
+```
+
+Rewrites the `source` field in every index entry to point to the pool path without computing checksums. Useful when only URLs need updating.
+
+**Usage:** `ous --source index.x86_64.json --base-url https://raw.codeberg.org/Cudane/Repository --arch x86_64`
+
+## sign_packages - GPG Signing
+
+```rust
+pub fn sign_packages(index_path: &str, packages_dir: &str, key_id: &str) -> Result<()>
+```
+
+Signs the index file and all `.xcs` packages with GPG detached ASCII-armored signatures. Also exports the public key as `pubkey.asc`.
+
+**Usage:** `ous -g index.x86_64.json pool/ --key ABCDEF1234567890`
+
+Requires `gpg` to be available on the system.
 
 ## Build / Resume
 
@@ -1029,7 +1091,7 @@ This is the main orchestrator function that ties together the entire build pipel
 
 10. **Metadata writing**: `write(&metadata, root_str)` writes `metadata.json` into the staging directory.
 
-11. **Index update**: `index()` appends or updates the entry in `index.json` in the output root.
+11. **Index update**: `index()` appends or updates the entry in `index.<arch>.json` in the output root.
 
 12. **Archiving**: `archive(root_str, &final_path)` compresses the staging directory into the final `.xcs` file.
 
@@ -1041,32 +1103,53 @@ This is the main orchestrator function that ties together the entire build pipel
 
 The CLI supports the following flags, each of which sets a corresponding environment variable or triggers a specific action:
 
+### Build Flags
+
 | Flag | Long Flag | Environment Variable | Action |
 | ------ | ----------- | --------------------- | -------- |
-| `-h` | `--help` | --- | Print help message and exit |
-| `-v` | `--version` | --- | Print version and exit |
-| `-a` | `--archive` | --- | Manual archive mode (takes 2 args: staging dir, output path) |
-| `-x` | `--extract` | --- | Extract mode (takes 1-2 args: package or dir, destination) |
-| `-w` | `--write` | --- | Write metadata mode (takes 2 args: src dir, dest dir) |
-| `-g` | `--hash-type` | `OUS_HASH_TYPE` | Set the checksum algorithm for package metadata (default: sha256)" |
-| `-i` | `--inspect` | --- | Inspect Engine (takes 1 arg: package path) |
+| `-m` | `--manifest <FILE>` | --- | Path to manifest.json |
+| `-o` | `--output <DIR>` | --- | Path to output directory |
+| `-t` | `--target <ARCH>` | `OUS_TARGET=<ARCH>` | Define target architecture |
 | `-n` | `--no-auto` | `OUS_NO_AUTO=1` | Disable automatic build and install behaviors |
 | `-f` | `--force` | `OUS_FORCE=1` | Overwrite existing `.xcs` packages |
 | `-c` | `--clean` | `OUS_CLEAN=1` | Clean workspace before building |
+| `-l` | `--parallel` | `OUS_PARALLEL=1` | Enable parallel package processing |
+| `-j` | `--jobs <NUM>` | `OUS_JOBS=<NUM>` | Set number of parallel make jobs (with -l) |
+| `-z` | `--zstd-level <NUM>` | `OUS_ZSTD_LEVEL=<NUM>` | Set zstd compression level for tar (default: 3) |
 | `-s` | `--strict` | `OUS_STRICT=1` | Fail immediately on dependency mapping errors |
-| `-q` | `--quiet` | `OUS_QUIET=1` | Suppress standard output messages |
 | `-d` | `--debug` | `OUS_DEBUG=1` | Enable verbose debug logging |
 | `-y` | `--yes` | `OUS_ASSUME_YES=1` | Assume yes to all prompts |
 | `-k` | `--keep-src` | `OUS_KEEP_SRC=1` | Do not delete source directory after build |
-| `-l` | `--parallel` | `OUS_PARALLEL=1` | Enable parallel package processing |
-| `-j` | `--jobs <NUM>` | `OUS_JOBS=<NUM>` | Set number of parallel make jobs |
-| `-z` | `--zstd-level <NUM>` | `OUS_ZSTD_LEVEL=<NUM>` | Set zstd compression level for tar |
 | `-p` | `--project <DIR>` | `OUS_PROJECT_WORKSPACE=<DIR>` | Define custom project or workspace directory |
-| `-t` | `--target <ARCH>` | `OUS_TARGET=<ARCH>` | Define target architecture |
-| `-m` | `--manifest <FILE>` | --- | Path to manifest.json |
-| `-o` | `--output <DIR>` | --- | Path to output directory |
 
-The environment variables are set using `unsafe { env::set_var(...) }` because the Rust standard library marks `set_var` as unsafe (it can cause data races in multi-threaded contexts). Since `Outsider` processes packages sequentially in a single thread, this is safe in practice.
+### Standalone Modes
+
+| Flag | Long Flag | Action |
+| ------ | ----------- | -------- |
+| `-a` | `--archive <SRC> <OUT>` | Manual archive mode (staging dir, output path) |
+| `-x` | `--extract <PKG> <DEST>` | Extract package(s) into target rootfs |
+| `-w` | `--write <SRC> <DEST>` | Write metadata.json without archiving |
+| `-i` | `--inspect <PKG>` | Inspect package specifications, size, and metadata |
+| `-b` | `--hash-type <TYPE>` | Set checksum algorithm (default: sha256) |
+
+### Repository Management
+
+| Flag | Long Flag | Action |
+| ------ | ----------- | -------- |
+| | `--sort <DIR> <ARCH>` | Sort `.xcs` files into `pool/<arch>/<name>/` directories |
+| | `--validate <INDEX> <DIR>` | Validate index + `.xcs` file consistency |
+| | `--checksum <INDEX> <DIR>` | Add SHA-256 checksums to index and rewrite source URLs |
+| | `--source <INDEX>` | Rewrite source URLs in index to pool paths |
+| `-g` | `--sign <INDEX> <DIR>` | GPG sign index + all `.xcs` packages |
+
+Additional flags for repository commands: `--base-url <URL>`, `--arch <ARCH>`, `--key <KEYID>`.
+
+### Other
+
+| Flag | Long Flag | Action |
+| ------ | ----------- | -------- |
+| `-h` | `--help` | Print help message and exit |
+| `-v` | `--version` | Print version and exit |
 
 </details>
 
@@ -1107,9 +1190,9 @@ The `license()` function implements a heuristic scanner that works as follows:
 
 <details><summary id="indexing">Indexing</summary>
 
-The `index()` function maintains a cumulative index of all packages built into a given output directory. The index is stored as `index.json` and follows this logic:
+The `index()` function maintains a per-architecture index of all packages built into a given output directory. The index is stored as `index.<arch>.json` and follows this logic:
 
-1. **Load existing index**: The function reads `{index_root}/index.json` if it exists. If the file is missing or corrupted, an empty list is used.
+1. **Load existing index**: The function reads `{index_root}/index.<arch>.json` if it exists. If the file is missing or corrupted, an empty list is used.
 
 2. **Match by identity**: The function searches for an existing entry with the same `pkg_name` and `version`. This is a compound key — both fields must match for an entry to be considered the same package.
 
@@ -1120,7 +1203,7 @@ The `index()` function maintains a cumulative index of all packages built into a
 
 4. **Sort**: The entries are sorted by `(pkg_name, version)` for deterministic ordering.
 
-5. **Write**: The sorted list is serialized to pretty-printed JSON and written to `index.json`.
+5. **Write**: The sorted list is serialized to pretty-printed JSON and written to `index.<arch>.json`.
 
 This design allows the index to be incrementally updated as new packages are built, without requiring a full rebuild of the index each time.
 
@@ -1402,7 +1485,7 @@ This prints:
 9. **Metadata Generation** (conditional): If the `metadata` step is not marked complete:
     - `mtd()` builds a `PackageMetadata` struct with license, checksums, dependencies, files, and provides.
     - `write()` writes `metadata.json` to the `pkg/` directory.
-    - `index()` updates `index.json` in the output root.
+    - `index()` updates `index.<arch>.json` in the output root.
 
 10. **Archiving** (conditional): If the `archive` step is not marked complete, `archive()` compresses the `pkg/` directory into `<name>-<version>.xcs` using `tar` with Zstandard compression.
 

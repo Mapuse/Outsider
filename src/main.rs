@@ -25,31 +25,41 @@ fn main() -> Result<()> {
                 println!("Render Line (Outsider) Build Engine\n");
                 utils::UserInterface::info("USAGE:");
                 println!("  ous [OPTIONS] <MANIFEST> <OUTPUT_DIR>\n");
-                utils::UserInterface::info("OPTIONS:");
-                println!("  -a, --archive <SRC> <OUT>  Manually archive a directory using tar.zstd (.xcs)");
-                println!("  -x, --extract <PKG> <DEST> Extract standalone package(s) into target rootfs");
-                println!("  -g, --hash-type <TYPE>     Set the checksum algorithm for package metadata (default: sha256)");
-                println!("  -w, --write <SRC> <DEST>   Generate metadata.json for directory without archiving");
-                println!("  -i, --inspect <PKG>        Inspect package specifications, size, and metadata");
-                println!("  -m, --manifest <FILE>      Path to manifest.json");
-                println!("  -o, --output <DIR>         Path to output directory");
-                println!("  -n, --no-auto              Disable automatic build/install behaviors");
-                println!("  -f, --force                Overwrite existing .xcs packages");
-                println!("  -c, --clean                Clean workspace before building");
-                println!("  -s, --strict               Fail immediately on dependency mapping errors");
-                println!("  -q, --quiet                Suppress standard output messages");
-                println!("  -d, --debug                Enable verbose debug logging");
-                println!("  -y, --yes                  Assume 'yes' to all prompts");
-                println!("  -k, --keep-src             Do not delete source directory after build");
-                println!("  -l, --parallel             Enable parallel package processing");
-                println!("  -j, --jobs <NUM>           Set number of parallel make jobs");
-                println!("  -z, --zstd-level <NUM>     Set zstd compression level for tar");
-                println!("  -p, --project <DIR>        Define custom project/workspace directory");
-                println!("  -t, --target <ARCH>        Define target architecture");
-                println!("  -v, --version              Print version information");
+                utils::UserInterface::info("BUILD:");
+                println!("  ous <manifest> <output_dir>   Build all packages from manifest");
+                println!("  -m, --manifest <FILE>        Path to manifest.json");
+                println!("  -o, --output <DIR>           Path to output directory");
+                println!("  -t, --target <ARCH>          Define target architecture");
+                println!("  -n, --no-auto                Disable automatic build/install behaviors");
+                println!("  -f, --force                  Overwrite existing .xcs packages");
+                println!("  -c, --clean                  Clean workspace before building");
+                println!("  -l, --parallel               Enable parallel package processing");
+                println!("  -j, --jobs <NUM>             Set number of parallel make jobs");
+                println!("  -z, --zstd-level <NUM>       Set zstd compression level (default: 3)");
+                println!("  -s, --strict                 Fail immediately on dependency mapping errors");
+                println!("  -d, --debug                  Enable verbose debug logging");
+                println!("  -y, --yes                    Assume 'yes' to all prompts");
+                println!("  -k, --keep-src               Do not delete source directory after build");
+                println!("  -p, --project <DIR>          Define custom project/workspace directory");
+                utils::UserInterface::info("STANDALONE:");
+                println!("  -a, --archive <SRC> <OUT>    Manually archive a directory using tar.zstd (.xcs)");
+                println!("  -x, --extract <PKG> <DEST>   Extract standalone package(s) into target rootfs");
+                println!("  -w, --write <SRC> <DEST>     Generate metadata.json for directory without archiving");
+                println!("  -i, --inspect <PKG>          Inspect package specifications, size, and metadata");
+                println!("  -b, --hash-type <TYPE>       Set the checksum algorithm for metadata (default: sha256)");
+                utils::UserInterface::info("REPOSITORY:");
+                println!("  --sort <DIR> <ARCH>          Sort .xcs files into pool/<arch>/<name>/");
+                println!("  --validate <INDEX> <DIR>     Validate index + .xcs file consistency");
+                println!("  --checksum <INDEX> <DIR>     Add SHA-256 checksums to index and rewrite source URLs");
+                println!("    --base-url <URL>           Base URL for source rewriting (with --checksum)");
+                println!("  --source <INDEX>             Rewrite source URLs in index to pool paths");
+                println!("    --base-url <URL>           Base URL for source rewriting (with --source)");
+                println!("  -g, --sign <INDEX> <DIR>     GPG sign index + all .xcs packages");
+                println!("    --key <KEYID>              GPG key ID for signing (with --sign)");
+                println!("  -v, --version                Print version information");
                 sys_process::exit(0);}
             "-v" | "--version" => {
-                println!("Outsider 0.5.0");
+                println!("Outsider 0.6.0");
                 sys_process::exit(0);
             }
             "-a" | "--archive" => {
@@ -59,8 +69,9 @@ fn main() -> Result<()> {
                     UserInterface::error(&format!("Usage: ous -a <staging_dir> <output_package.xcs>"));
                     sys_process::exit(1);
                 }
+                let level = env::var("OUS_ZSTD_LEVEL").unwrap_or_else(|_| "3".to_string());
                 let status = sys_process::Command::new("sh")
-                    .args(["-c", &format!("tar -c -C {} . | zstd -3 > {}", staging_dir, output_package)])
+                    .args(["-c", &format!("tar -c -C {} . | zstd -{} > {}", staging_dir, level, output_package)])
                     .status()?;
                 if !status.success() { UserInterface::error(&format!("Manual archive compression failed")); }
                 UserInterface::info(&format!("Successfully archived {} to {}", staging_dir, output_package));
@@ -96,7 +107,7 @@ fn main() -> Result<()> {
                 }
                 sys_process::exit(0);
             }
-            "-g" | "--hash-type" => {
+            "-b" | "--hash-type" => {
                 if let Some(val) = args.next() {
                     unsafe { env::set_var("OUS_HASH_TYPE", val) };
                 }
@@ -228,6 +239,96 @@ fn main() -> Result<()> {
 
                 sys_process::exit(0);
             },
+            "--sort" => {
+                let dir = args.next().into_iter().next().unwrap_or_default();
+                let arch = args.next().into_iter().next().unwrap_or_else(|| "native".to_string());
+                if dir.is_empty() {
+                    UserInterface::error("Usage: ous --sort <dir> <arch>");
+                    sys_process::exit(1);
+                }
+                ous::sort_packages(&dir, &arch)?;
+                sys_process::exit(0);
+            }
+            "--validate" => {
+                let index_path = args.next().into_iter().next().unwrap_or_default();
+                let packages_dir = args.next().into_iter().next().unwrap_or_else(|| ".".to_string());
+                if index_path.is_empty() {
+                    UserInterface::error("Usage: ous --validate <index.json> <packages_dir>");
+                    sys_process::exit(1);
+                }
+                let problems = ous::validate(&index_path, &packages_dir)?;
+                sys_process::exit(problems as i32);
+            }
+            "--checksum" => {
+                let index_path = args.next().into_iter().next().unwrap_or_default();
+                let pkg_dir = args.next().into_iter().next().unwrap_or_else(|| ".".to_string());
+                if index_path.is_empty() {
+                    UserInterface::error("Usage: ous --checksum <index.json> <pkg_dir> [--base-url URL] [--arch ARCH]");
+                    sys_process::exit(1);
+                }
+                let mut base_url = env::var("CUDANE_REPO_URL").unwrap_or_else(|_| "https://raw.codeberg.org/Cudane/Repository".to_string());
+                let mut arch = env::var("CUDANE_TARGET").unwrap_or_else(|_| "x86_64-unknown-linux-musl".to_string());
+                while let Some(next) = args.peek() {
+                    if next == "--base-url" {
+                        args.next();
+                        base_url = args.next().unwrap_or_default();
+                    } else if next == "--arch" {
+                        args.next();
+                        arch = args.next().unwrap_or_default();
+                    } else {
+                        break;
+                    }
+                }
+                ous::checksum_index(&index_path, &pkg_dir, &base_url, &arch)?;
+                sys_process::exit(0);
+            }
+            "--source" => {
+                let index_path = args.next().into_iter().next().unwrap_or_default();
+                if index_path.is_empty() {
+                    UserInterface::error("Usage: ous --source <index.json> [--base-url URL] [--arch ARCH]");
+                    sys_process::exit(1);
+                }
+                let mut base_url = env::var("CUDANE_REPO_URL").unwrap_or_else(|_| "https://raw.codeberg.org/Cudane/Repository".to_string());
+                let mut arch = env::var("CUDANE_TARGET").unwrap_or_else(|_| "x86_64-unknown-linux-musl".to_string());
+                while let Some(next) = args.peek() {
+                    if next == "--base-url" {
+                        args.next();
+                        base_url = args.next().unwrap_or_default();
+                    } else if next == "--arch" {
+                        args.next();
+                        arch = args.next().unwrap_or_default();
+                    } else {
+                        break;
+                    }
+                }
+                ous::rewrite_source(&index_path, &base_url, &arch)?;
+                sys_process::exit(0);
+            }
+            "-g" | "--sign" => {
+                let index_path = args.next().into_iter().next().unwrap_or_default();
+                let packages_dir = args.next().into_iter().next().unwrap_or_else(|| ".".to_string());
+                if index_path.is_empty() {
+                    UserInterface::error("Usage: ous --sign <index.json> <packages_dir> --key <KEYID>");
+                    sys_process::exit(1);
+                }
+                let mut key_id = String::new();
+                while let Some(next) = args.peek() {
+                    if next == "--key" {
+                        args.next();
+                        key_id = args.next().unwrap_or_default();
+                    } else {
+                        break;
+                    }
+                }
+                if key_id.is_empty() {
+                    key_id = env::var("GPG_KEY_ID").unwrap_or_else(|_| {
+                        UserInterface::error("--key <KEYID> or GPG_KEY_ID env var required");
+                        sys_process::exit(1);
+                    });
+                }
+                ous::sign_packages(&index_path, &packages_dir, &key_id)?;
+                sys_process::exit(0);
+            }
             "-n" | "--no-auto" =>
                 unsafe { env::set_var("OUS_NO_AUTO", "1")
             },
@@ -272,7 +373,7 @@ fn main() -> Result<()> {
                     };
                 }
             },
-            "-z" | "--zstd" => {
+            "-z" | "--zstd-level" => {
                 if let Some(val) = args.next() { 
                     unsafe {
                         env::set_var("OUS_ZSTD_LEVEL", val)
@@ -326,16 +427,64 @@ fn main() -> Result<()> {
             anyhow!("Failed to create output directory {}: {}", output_dir, e)
     })?;
 
-    for pkg in &manifest.packages {
-        match process(pkg, &output_dir) {
-            Ok(p) => {
-                if env::var("OUS_QUIET").is_err() {
-                    UserInterface::success(&format!("OK: {}", p));
-                }
+    let parallel = env::var("OUS_PARALLEL").is_ok();
+    let jobs: usize = env::var("OUS_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+
+    if parallel && manifest.packages.len() > 1 {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_concurrent = jobs.max(1);
+
+        for pkg in manifest.packages {
+            while active.load(std::sync::atomic::Ordering::SeqCst) >= max_concurrent {
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(e) => {
-                UserInterface::error(&format!("Abort: {}", e));
+            let tx = tx.clone();
+            let active = std::sync::Arc::clone(&active);
+            let out = output_dir.clone();
+            let quiet = env::var("OUS_QUIET").is_ok();
+            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            handles.push(thread::spawn(move || {
+                let result = match process(&pkg, &out) {
+                    Ok(p) => { if !quiet { format!("OK: {}", p) } else { String::new() } }
+                    Err(e) => { format!("Abort: {}", e) }
+                };
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = tx.send(result);
+            }));
+        }
+        drop(tx);
+
+        for msg in rx.iter() {
+            if msg.starts_with("Abort:") {
+                UserInterface::error(&msg);
                 sys_process::exit(1);
+            } else if !msg.is_empty() && env::var("OUS_QUIET").is_err() {
+                UserInterface::success(&msg);
+            }
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+    } else {
+        for pkg in &manifest.packages {
+            match process(pkg, &output_dir) {
+                Ok(p) => {
+                    if env::var("OUS_QUIET").is_err() {
+                        UserInterface::success(&format!("OK: {}", p));
+                    }
+                }
+                Err(e) => {
+                    UserInterface::error(&format!("Abort: {}", e));
+                    sys_process::exit(1);
+                }
             }
         }
     }

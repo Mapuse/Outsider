@@ -447,7 +447,7 @@ pub fn scan(dest_dir: &str, log_content: &str, current_pkg: &Package, repo_root:
         }
     }
 
-    let index_graph = loadex(repo_root)?;
+    let index_graph = loadex(repo_root, &current_pkg.arch)?;
     let mut visited: HashSet<String> = HashSet::new();
     for package_name in deps_map.keys().cloned().collect::<Vec<_>>() {
         transitive(
@@ -648,8 +648,13 @@ fn mltp(repo_root: &Path) -> Result<HashMap<String, Vec<String>>> {
     Ok(library_packages)
 }
 
-fn loadex(repo_root: &Path) -> Result<HashMap<String, HashSet<String>>> {
-    let index_path = repo_root.join("index.json");
+fn loadex(repo_root: &Path, arch: &str) -> Result<HashMap<String, HashSet<String>>> {
+    let arch_name = if arch.is_empty() || arch == "native" {
+        "native".to_string()
+    } else {
+        arch.to_string()
+    };
+    let index_path = repo_root.join(format!("index.{}.json", arch_name));
     let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
 
     if !index_path.exists() {
@@ -738,12 +743,12 @@ pub fn write(meta: &PackageMetadata, dest: &str) -> Result<()> {
 }
 
 pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
-    let index_name = if meta.arch.is_empty() || meta.arch == "native" {
-        "index.json".to_string()
+    let arch = if meta.arch.is_empty() || meta.arch == "native" {
+        "native".to_string()
     } else {
-        format!("index.{}.json", meta.arch)
+        meta.arch.clone()
     };
-    let index_path = Path::new(index_root).join(index_name);
+    let index_path = Path::new(index_root).join(format!("index.{}.json", arch));
     fs::create_dir_all(index_root)?;
 
     let mut entries: Vec<PackageMetadata> = if index_path.exists() {
@@ -770,7 +775,8 @@ pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
 }
 
 pub fn archive(dest: &str, out: &str) -> Result<()> {
-    let status = Command::new("sh").args(["-c", &format!("tar -c -C {} . | zstd -3 > {}", dest, out)]).status()?;
+    let level = env::var("OUS_ZSTD_LEVEL").unwrap_or_else(|_| "3".to_string());
+    let status = Command::new("sh").args(["-c", &format!("tar -c -C {} . | zstd -{} > {}", dest, level, out)]).status()?;
     if status.success() { Ok(()) } else { Err(anyhow!("Archive compression failed")) }
 }
 
@@ -907,4 +913,226 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     }
 
     Ok(final_path)
+}
+
+pub fn sort_packages(dir: &str, arch: &str) -> Result<()> {
+    let pool_dir = Path::new(dir);
+    if !pool_dir.exists() {
+        return Err(anyhow!("Directory '{}' not found", dir));
+    }
+    let pattern = Regex::new(r"^(.*)-(\d.*?)\.xcs$")?;
+    let mut moved = 0;
+    for entry in fs::read_dir(pool_dir)? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !fname.ends_with(".xcs") || !entry.path().is_file() {
+            continue;
+        }
+        if let Some(caps) = pattern.captures(&fname) {
+            let pkg_name = &caps[1];
+            let target_dir = pool_dir.join(arch).join(pkg_name);
+            fs::create_dir_all(&target_dir)?;
+            let target = target_dir.join(&fname);
+            fs::rename(entry.path(), &target)?;
+            if env::var("OUS_QUIET").is_err() {
+                UserInterface::info(&format!("Moved: {} -> {}/{}", fname, arch, pkg_name));
+            }
+            moved += 1;
+        }
+    }
+    UserInterface::success(&format!("Sorted {} packages into pool/{}/{}/", moved, dir, arch));
+    Ok(())
+}
+
+pub fn validate(index_path: &str, packages_dir: &str) -> Result<usize> {
+    let mut problems = 0usize;
+    let index_file = Path::new(index_path);
+    let mut index_entries: Vec<PackageMetadata> = Vec::new();
+
+    if !index_file.exists() {
+        UserInterface::warning(&format!("{} not found — skipping index validation", index_path));
+    } else {
+        let content = fs::read_to_string(index_file)?;
+        match serde_json::from_str::<Vec<PackageMetadata>>(&content) {
+            Ok(data) => {
+                index_entries = data;
+                UserInterface::success(&format!("{}: valid flat array ({} packages)", index_path, index_entries.len()));
+                let mut seen = HashSet::new();
+                for entry in &index_entries {
+                    if entry.pkg_name.is_empty() {
+                        UserInterface::error("entry: missing pkg_name");
+                        problems += 1;
+                    }
+                    if entry.version.is_empty() {
+                        UserInterface::error(&format!("{}: missing version", entry.pkg_name));
+                        problems += 1;
+                    }
+                    if seen.contains(&entry.pkg_name) {
+                        UserInterface::error(&format!("{}: duplicate entry", entry.pkg_name));
+                        problems += 1;
+                    }
+                    seen.insert(entry.pkg_name.clone());
+                }
+            }
+            Err(e) => {
+                UserInterface::error(&format!("{} is not valid JSON: {}", index_path, e));
+                problems += 1;
+            }
+        }
+    }
+
+    let pkg_dir = Path::new(packages_dir);
+    if pkg_dir.exists() && !index_entries.is_empty() {
+        let index_names: HashSet<String> = index_entries.iter().map(|e| e.pkg_name.clone()).collect();
+        let mut built_names = HashSet::new();
+        for entry in fs::read_dir(pkg_dir)? {
+            let entry = entry?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if fname.ends_with(".xcs") {
+                let stem = fname.trim_end_matches(".xcs");
+                if let Some(pos) = stem.rfind('-') {
+                    built_names.insert(stem[..pos].to_string());
+                }
+            }
+        }
+        let orphaned: Vec<&String> = built_names.difference(&index_names).collect();
+        for name in &orphaned {
+            UserInterface::warning(&format!("{}: built .xcs found but no entry in {}", name, index_path));
+        }
+        let missing: Vec<&String> = index_names.difference(&built_names).collect();
+        for name in &missing {
+            UserInterface::warning(&format!("{}: in {} but no .xcs in {}", name, index_path, packages_dir));
+        }
+        UserInterface::success(&format!("{} built, {} indexed, {} orphaned, {} missing",
+            built_names.len(), index_entries.len(), orphaned.len(), missing.len()));
+    }
+
+    if pkg_dir.exists() {
+        for entry in fs::read_dir(pkg_dir)? {
+            let entry = entry?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if !fname.ends_with(".xcs") { continue; }
+            let path = entry.path();
+            let mut file = fs::File::open(&path)?;
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_ok() {
+                if magic != [0x28, 0xB5, 0x2F, 0xFD] {
+                    UserInterface::warning(&format!("{}: not a valid zstd archive (bad magic)", fname));
+                    problems += 1;
+                }
+            }
+        }
+    }
+
+    if problems > 0 {
+        UserInterface::error(&format!("Validation: {} issue(s) found", problems));
+    } else {
+        UserInterface::success("Validation: all checks passed");
+    }
+    Ok(problems)
+}
+
+pub fn checksum_index(index_path: &str, pkg_dir: &str, base_url: &str, arch: &str) -> Result<()> {
+    let index_file = Path::new(index_path);
+    if !index_file.exists() {
+        UserInterface::warning(&format!("{} not found — skipping", index_path));
+        return Ok(());
+    }
+    let content = fs::read_to_string(index_file)?;
+    let mut index: Vec<PackageMetadata> = serde_json::from_str(&content)?;
+
+    let pattern = Regex::new(r"^(.*)-(\d.*?)\.xcs$")?;
+    let mut by_key: HashMap<(String, String), usize> = HashMap::new();
+    for (i, entry) in index.iter().enumerate() {
+        by_key.insert((entry.pkg_name.clone(), entry.version.clone()), i);
+    }
+
+    let mut count = 0;
+    let pkg_path = Path::new(pkg_dir);
+    if pkg_path.exists() {
+        for entry in fs::read_dir(pkg_path)? {
+            let entry = entry?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if !fname.ends_with(".xcs") { continue; }
+            if let Some(caps) = pattern.captures(&fname) {
+                let pkg_name = caps[1].to_string();
+                let version = caps[2].to_string();
+                if let Some(&idx) = by_key.get(&(pkg_name.clone(), version.clone())) {
+                    let file_bytes = fs::read(entry.path())?;
+                    use sha2::Digest;
+                    let mut hasher = Sha256::new();
+                    hasher.update(&file_bytes);
+                    let result = hasher.finalize();
+                    let hash = result.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                    index[idx].checksum = Checksum { kind: "sha256".to_string(), value: hash.clone() };
+                    index[idx].source = format!("{}/pool/{}/{}/{}.xcs", base_url.trim_end_matches('/'), arch, pkg_name, fname);
+                    count += 1;
+                    if env::var("OUS_QUIET").is_err() {
+                        UserInterface::info(&format!("{} -> sha256={}...", fname, &hash[..16]));
+                    }
+                }
+            }
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&index)?;
+    fs::write(index_file, json)?;
+    UserInterface::success(&format!("Updated {} entries in {}", count, index_path));
+    Ok(())
+}
+
+pub fn rewrite_source(index_path: &str, base_url: &str, arch: &str) -> Result<()> {
+    let index_file = Path::new(index_path);
+    if !index_file.exists() {
+        return Err(anyhow!("Index not found at {}", index_path));
+    }
+    let content = fs::read_to_string(index_file)?;
+    let mut index: Vec<PackageMetadata> = serde_json::from_str(&content)?;
+    for entry in &mut index {
+        let url = format!("{}/pool/{}/{}/{}-{}.xcs",
+            base_url.trim_end_matches('/'), arch, entry.pkg_name, entry.pkg_name, entry.version);
+        entry.source = url;
+    }
+    let json = serde_json::to_string_pretty(&index)?;
+    fs::write(index_file, json)?;
+    UserInterface::success(&format!("Rewrote source URLs in {} ({} packages)", index_path, index.len()));
+    Ok(())
+}
+
+pub fn sign_packages(index_path: &str, packages_dir: &str, key_id: &str) -> Result<()> {
+    let mut args = vec!["--batch", "--yes", "-u", key_id, "--detach-sign"];
+    let index_file = Path::new(index_path);
+    if index_file.exists() {
+        args.push(index_path);
+        let status = Command::new("gpg").args(&args).status()?;
+        if !status.success() {
+            UserInterface::warning(&format!("GPG signing of {} failed", index_path));
+        } else {
+            UserInterface::success(&format!("Signed: {}", index_path));
+        }
+    }
+
+    let pkg_dir = Path::new(packages_dir);
+    if pkg_dir.exists() {
+        for entry in fs::read_dir(pkg_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "xcs") {
+                let mut sign_args = vec!["--batch", "--yes", "-u", key_id, "--detach-sign"];
+                sign_args.push(path.to_str().unwrap());
+                let status = Command::new("gpg").args(&sign_args).status()?;
+                if status.success() && env::var("OUS_QUIET").is_err() {
+                    UserInterface::info(&format!("Signed: {}", path.file_name().unwrap().to_string_lossy()));
+                }
+            }
+        }
+    }
+
+    let pubkey_args = vec!["--batch", "--yes", "-u", key_id, "--export", "--armor"];
+    let output = Command::new("gpg").args(&pubkey_args).output()?;
+    if output.status.success() {
+        fs::write("pubkey.asc", &output.stdout)?;
+        UserInterface::success("Exported public key: pubkey.asc");
+    }
+    Ok(())
 }

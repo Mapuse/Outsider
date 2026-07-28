@@ -20,7 +20,7 @@
 
 `▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
 
-**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for the **Cudane** Linux ecosystem (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into `.xcs` binary packages, and automatically writes per-architecture **`index.<arch>.json`** files for your own repository of packages (with auto-updating support).
+**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for the **Cudane** Linux ecosystem (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into `.xcs` binary packages, and automatically writes per-architecture **`index.<arch>.json`** files for your own repository of packages (with auto-updating support). It detects Cesar service files, multi-service declarations, binary entries, and component tiers — writing all of this into the package metadata for MCX to consume.
 
 `▐▄` `-` `▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▌`
 
@@ -98,6 +98,9 @@ pub struct Package {
     pub install_cmd: String,
     pub links: Option<std::collections::HashMap<String, String>>,
     pub arch: String,
+    pub services: Option<Vec<ServiceDecl>>,
+    pub components: Option<Vec<String>>,
+    pub binaries: Option<Vec<BinaryEntry>>,
 }
 ```
 
@@ -167,6 +170,18 @@ The shell command to install built artifacts into the staging directory. The beh
 
 The target architecture for the package. Supports multi-arch builds — common values are `"amd64"`, `"arm64"`, or `"native"` (which means build for the host architecture). When omitted from the manifest, it defaults to `"native"` for backward compatibility. The architecture is propagated into the package metadata and can be used by downstream tools to select the correct package variant for a given target platform.
 
+### services (Option<Vec<ServiceDecl>>)
+
+An optional list of Cesar service declarations. When present, Outsider scans the staging directory for service files and records them in the package metadata. MCX uses this to automatically register/unregister services on install/remove.
+
+### components (Option<Vec<String>>)
+
+An optional list of component tier classifications (e.g., `"required"`, `"recommended"`, `"optional"`, `"development"`). MCX uses this for partial install/upgrade/remove operations.
+
+### binaries (Option<Vec<BinaryEntry>>)
+
+An optional list of binary entries discovered in `system/bin/`. Each entry maps a command name to its binary path. MCX uses this for command-not-found resolution.
+
 ### links (Option<HashMap<String, String>>)
 
 An optional map of symbolic links to create inside the package staging directory after installation. The map keys are the **target** paths (what the symlink points to) and the values are the **link** paths (where the symlink is placed). For example:
@@ -214,6 +229,9 @@ pub struct PackageMetadata {
     pub files: Vec<PathBuf>,
     pub provides: Option<Vec<String>>,
     pub conflicts: Option<Vec<String>>,
+    pub services: Option<Vec<ServiceDecl>>,
+    pub components: Option<Vec<String>>,
+    pub binaries: Option<Vec<BinaryEntry>>,
 }
 ```
 
@@ -549,31 +567,54 @@ The Binary Reader opens each ELF binary (both executables and shared libraries) 
 
 <details><summary id="starting">Starting</summary>
 
-Build the engine (GNU-based distributions):
+## Installation
+
+All build systems auto-detect `x86_64`/`aarch64` and select the correct musl target. Cross-compilation files are in `env.mk`, `toolchain.cmake`, and `cross.txt` (generated via `gen-cross.sh`).
+
+### Cargo (direct)
 
 ```shell
 cargo build --release
+# Binary: target/release/ous
+# Install:
+install -Dm755 target/release/ous /system/bin/ous
 ```
 
-With musl targets:
+### Make
 
 ```shell
-# 1. Add the musl target:
-rustup target add x86_64-unknown-linux-musl
-
-# 2. Build:
-cargo build --release --target x86_64-unknown-linux-musl
+make build                    # auto-detects arch, builds for host
+make install                  # installs to /system/bin/ous
+make install DESTDIR=/mnt     # staged install
 ```
 
-Run with a manifest and an output directory:
+### Meson
+
+```shell
+meson setup builddir --cross-file /home/m/cudane-build/cross.txt --prefix=/system
+meson compile -C builddir
+meson install -C builddir
+```
+
+### Ninja
+
+```shell
+ninja -f build.ninja                       # build
+ninja -f build.ninja install DESTDIR=/mnt  # staged install
+```
+
+### CMake
+
+```shell
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake -DCMAKE_INSTALL_PREFIX=/system
+cmake --build build
+cmake --install build
+```
+
+### Running
 
 ```shell
 ./target/release/ous manifest.json output
-```
-
-Optional flag:
-
-```shell
 ./target/release/ous manifest.json output --no-auto
 ```
 
@@ -1099,6 +1140,228 @@ This is the main orchestrator function that ties together the entire build pipel
 
 </details>
 
+<details><summary id="plugin">Python Plugin System</summary>
+
+## Python Plugin System
+
+Outsider uses a TOML configuration file at `etc/ous/p.desc` to define plugins. The plugin system is **completely open** — any Python code is accepted. The only validation is a syntax check (`python3 -c "compile(...)"`). There are no restrictions on what your plugin can do.
+
+### Plugin configuration (`etc/ous/p.desc`)
+
+```toml
+[plugin.1]
+name = "My Plugin"
+path = "/path/to/plugin1.py"
+ls = "ls -la"
+build-all = "cargo build --release && cargo test"
+custom = "some-tool --flag && another-tool"
+
+[plugin.2]
+name = "Another Plugin"
+path = "~/plugins/plugin2.py"
+```
+
+#### Config fields
+
+| Field | Required | Description |
+| ----- | -------- | ----------- |
+| `name` | yes | Display name for the plugin. Does not need to match the Python file's content or filename. |
+| `path` | yes | Path to the `.py` file. Supports absolute paths and `~` for home directory expansion. |
+| `<alias>` | no | **Unlimited.** Any extra key is treated as an alias. The key is the alias name, the value is the shell command to execute. Supports `&&` for chaining. Any characters are allowed in the key and value: `-`, `/`, `@`, `#`, `$`, `%`, `^`, `&`, `*`, `(`, `)`, `[`, `]`, `{`, `}`, `'`, `"`, `;`, `:`, `\`, `|`, spaces, UTF-8, emoji, etc. |
+
+#### How plugins are discovered
+
+1. **Primary**: If `etc/ous/p.desc` exists, Outsider reads it and loads every `[plugin.*]` section. Each section becomes a plugin.
+2. **Fallback**: If `p.desc` does not exist, Outsider scans `var/lib/ous/plugins/` for any `.py` files and loads them automatically.
+
+### Alias system
+
+Aliases are **unlimited per plugin** and have **no naming restrictions**. The key can be any string, and the value is a shell command executed via `sh -c`.
+
+```toml
+[plugin.tools]
+name = "Toolbox"
+path = "/opt/plugins/tools.py"
+
+# Simple aliases
+ls = "ls -la"
+find = "find / -name"
+
+# Chained commands (&&)
+build-all = "cargo build --release && cargo test && cargo clippy"
+
+# Complex shell pipelines
+deploy = "rsync -avz ./dist/ user@host:/app/ && ssh user@host 'systemctl restart app'"
+
+# Commands with special characters
+test = "cargo test && cargo clippy"
+grep-logs = "grep -r 'ERROR' /var/log/ | head -20"
+backup = "tar -czf /tmp/backup-$(date +%Y%m%d).tar.gz /etc/ous/"
+
+# Any characters work
+weird-path = "/opt/my tool/bin/run.sh --config='path with spaces'"
+json-tool = "python3 -c \"import json; print(json.dumps({'key': 'value'}))\""
+```
+
+Run any alias via:
+
+```shell
+ous --plugin run <plugin-name> <alias-name>
+# Example:
+ous --plugin run tools build-all
+ous --plugin run tools deploy
+```
+
+### Creating a plugin from scratch
+
+#### Step 1 — Write a Python file
+
+Your plugin can be any valid Python code. There is no required structure, no base class, no imports you must use. The only thing Outsider provides is a global variable `MCX_EVENT` containing JSON data about the current operation.
+
+```python
+# /opt/ous/var/lib/ous/plugins/hello.py
+import json, os
+
+# MCX_EVENT is injected as a global variable containing event JSON
+event_str = os.environ.get("MCX_EVENT", "{}")
+event = json.loads(event_str)
+pkg = event.get("package", "unknown")
+print(f"Hello from plugin! Package: {pkg}")
+```
+
+#### Step 2 — Add to config (optional)
+
+```toml
+# /etc/ous/p.desc
+[plugin.1]
+name = "Hello Plugin"
+path = "/opt/ous/var/lib/ous/plugins/hello.py"
+hello = "echo 'Hello from alias!'"
+multi = "echo step1 && echo step2 && echo step3"
+```
+
+Or place the `.py` file in `var/lib/ous/plugins/` and it will be auto-discovered.
+
+#### Step 3 — Test it
+
+```shell
+ous --plugin run hello
+```
+
+### Plugin event data
+
+When Outsider fires a hook, it passes a JSON event to your plugin. The event is available as the global variable `MCX_EVENT` (a Python dict after `json.loads()`).
+
+#### Event fields
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `hook` | string | The hook name (e.g., `"pre-build"`, `"post-fetch"`) |
+| `package` | string or null | Package name being built |
+| `version` | string or null | Package version |
+| `source` | string or null | Source URL or path |
+| `build_type` | string or null | Build type (e.g., `"rust"`, `"make"`, `"custom"`) |
+| `work_dir` | string or null | Working directory for the build |
+| `root_dir` | string or null | Target root directory |
+| `output_path` | string or null | Output path for archives |
+| `arch` | string or null | Target architecture |
+
+#### Outsider hooks
+
+| Hook | When it fires |
+| ---- | ------------- |
+| `pre-fetch` | Before fetching source code |
+| `post-fetch` | After fetching source code |
+| `pre-build` | Before building the package |
+| `post-build` | After building the package |
+| `pre-install` | Before installing artifacts to staging |
+| `post-install` | After installing artifacts to staging |
+| `pre-hash` | Before computing checksums |
+| `post-hash` | After computing checksums |
+| `pre-metadata` | Before generating metadata |
+| `post-metadata` | After generating metadata |
+| `pre-archive` | Before compressing to .xcs |
+| `post-archive` | After compressing to .xcs |
+
+#### Reading the event in Python
+
+```python
+import json, os
+
+event = json.loads(os.environ.get("MCX_EVENT", "{}"))
+
+hook = event.get("hook", "")
+package = event.get("package", "")
+version = event.get("version", "")
+arch = event.get("arch", "")
+
+if hook == "post-build":
+    print(f"Built {package} v{version} for {arch}")
+
+if hook == "pre-fetch":
+    print(f"About to fetch source for {package}")
+```
+
+### Plugin output protocol
+
+Plugins communicate results via **exit code**:
+
+- Exit `0`: success
+- Exit non-zero: failure (stderr is captured as the error message)
+
+If your plugin prints JSON to stdout with `{"success": true, "message": "..."}`, Outsider will parse it. Otherwise, stdout is treated as the message.
+
+### Plugin aliases via CLI
+
+```shell
+ous --plugin list                     # list all loaded plugins with their aliases
+ous --plugin run <name> <alias>       # run a specific alias
+ous --plugin reload                   # re-scan plugins directory
+ous --plugin reload-config            # reload from p.desc TOML config
+```
+
+### Plugin lifecycle
+
+1. **Discovery**: Outsider reads `etc/ous/p.desc` (or scans `var/lib/ous/plugins/`).
+2. **Loading**: Python syntax is validated via `python3 -c "compile(open(path).read(), path, 'exec')"`. If invalid, the plugin is rejected with an error.
+3. **Wiring**: Each plugin is registered for all hooks. Aliases are stored for CLI invocation.
+4. **Execution**: When a hook fires, Outsider runs `python3 -c "import json, sys; MCX_EVENT = json.loads('...'); exec(open('plugin.py').read())"`. The plugin has full access to the Python standard library and any installed packages.
+5. **Hot-swap**: `reload` and `reload-config` allow loading new plugins without restarting Outsider.
+
+### Advanced plugin example
+
+```python
+# /opt/ous/var/lib/ous/plugins/build_monitor.py
+import json, os, subprocess, datetime
+
+event = json.loads(os.environ.get("MCX_EVENT", "{}"))
+hook = event.get("hook", "")
+pkg = event.get("package", "unknown")
+version = event.get("version", "")
+arch = event.get("arch", "native")
+
+# Log all build events to a file
+with open("/var/log/ous-plugins.log", "a") as f:
+    f.write(f"[{datetime.datetime.now()}] {hook}: {pkg} v{version} ({arch})\n")
+
+# Custom behavior per hook
+if hook == "post-build":
+    # Run tests after every build
+    subprocess.run(["cargo", "test"], check=False)
+
+elif hook == "pre-archive":
+    # Strip debug symbols before archiving
+    subprocess.run(["strip", "--strip-all", f"pkg/usr/bin/{pkg}"], check=False)
+
+elif hook == "post-archive":
+    # Notify admin after successful package creation
+    subprocess.run(["wall", f"Package {pkg} v{version} built successfully for {arch}"])
+
+print(json.dumps({"success": True, "message": f"Hook {hook} executed for {pkg}"}))
+```
+
+</details>
+
 <details><summary id="cli">CLI</summary>
 
 The CLI supports the following flags, each of which sets a corresponding environment variable or triggers a specific action:
@@ -1511,7 +1774,6 @@ see [**`LICENSE`**](https://codeberg.org/Cudane/Outsider/src/branch/master/LICEN
 
 `▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
 
-- **`Version`:** **`0.5.0`**.
-- **`Architecture`:** **`x86_64-unknown-linux-musl`** (**`amd64`**).
+- **`Version`:** **`0.7.0`**.
 
 `▐▄` `-` `▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▌`

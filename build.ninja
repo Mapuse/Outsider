@@ -1,0 +1,21 @@
+# Outsider — build.ninja (auto-detects amd64/arm64)
+# Usage: ninja
+#        ninja install DESTDIR=/mnt PREFIX=/system/bin
+
+rule cargo
+  command = sh -c 'case $$(uname -m) in x86_64) T=x86_64-unknown-linux-musl;; aarch64) T=aarch64-unknown-linux-musl;; *) echo "unsupported: $$(uname -m)"; exit 1;; esac; CARGO_TARGET_DIR=$$(pwd)/builddir/cargo cargo build --target $$T --release --locked --manifest-path $$(pwd)/Cargo.toml'
+  description = cargo build ous
+
+rule install
+  command = install -Dm755 $in $out
+  description = install $out
+
+srcdir = .
+builddir = builddir
+PREFIX ?= /system/bin
+DESTDIR ?=
+
+build $builddir/ous: cargo
+default $builddir/ous
+
+build $DESTDIR$(PREFIX)/ous: install $builddir/ous

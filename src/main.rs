@@ -56,11 +56,74 @@ fn main() -> Result<()> {
                 println!("    --base-url <URL>           Base URL for source rewriting (with --source)");
                 println!("  -g, --sign <INDEX> <DIR>     GPG sign index + all .xcs packages");
                 println!("    --key <KEYID>              GPG key ID for signing (with --sign)");
+                utils::UserInterface::info("PLUGIN:");
+                println!("  --plugin list            List loaded plugins");
+                println!("  --plugin run <name> <alias>  Run a plugin alias");
+                println!("  --plugin reload           Re-scan plugins directory");
+                println!("  --plugin reload-config    Reload from p.desc TOML config");
                 println!("  -v, --version                Print version information");
                 sys_process::exit(0);}
             "-v" | "--version" => {
-                println!("Outsider 0.6.0");
+                println!("Outsider 0.7.0");
                 sys_process::exit(0);
+            }
+            "--plugin" => {
+                let sub = args.next().unwrap_or_default();
+                let cwd = env::current_dir()?;
+                let plugin_mgr = ous::plugin::PluginManager::new(&cwd);
+                match sub.as_str() {
+                    "list" => {
+                        let list = plugin_mgr.list();
+                        if list.is_empty() {
+                            UserInterface::info("No plugins loaded.");
+                        } else {
+                            for p in &list {
+                                let aliases: Vec<&str> = p.aliases.keys().map(|s| s.as_str()).collect();
+                                let alias_str = if aliases.is_empty() { String::new() } else { format!(" [aliases: {}]", aliases.join(", ")) };
+                                UserInterface::info(&format!("  {} ({}){}", p.name(), p.path().display(), alias_str));
+                            }
+                        }
+                        sys_process::exit(0);
+                    }
+                    "run" => {
+                        let name = args.next().unwrap_or_default();
+                        let alias = args.next().unwrap_or_default();
+                        if name.is_empty() || alias.is_empty() {
+                            UserInterface::error("Usage: ous -p run <plugin-name> <alias>");
+                            sys_process::exit(1);
+                        }
+                        match plugin_mgr.find(&name) {
+                            Some(p) => match p.run_alias(&alias) {
+                                Ok(result) => {
+                                    if let Some(msg) = &result.message {
+                                        println!("{}", msg);
+                                    }
+                                    if !result.success { sys_process::exit(1); }
+                                }
+                                Err(e) => { UserInterface::error(&format!("{}", e)); sys_process::exit(1); }
+                            },
+                            None => { UserInterface::error(&format!("Plugin '{}' not found", name)); sys_process::exit(1); }
+                        }
+                        sys_process::exit(0);
+                    }
+                    "reload" => {
+                        plugin_mgr.reload(&cwd);
+                        let count = plugin_mgr.list().len();
+                        UserInterface::success(&format!("Loaded {} plugin(s)", count));
+                        sys_process::exit(0);
+                    }
+                    "reload-config" => {
+                        match plugin_mgr.reload_from_config(&cwd) {
+                            Ok(n) => { UserInterface::success(&format!("Loaded {} new plugin(s)", n)); }
+                            Err(e) => { UserInterface::error(&format!("{}", e)); sys_process::exit(1); }
+                        }
+                        sys_process::exit(0);
+                    }
+                    _ => {
+                        UserInterface::error("Usage: ous -p <list|run|reload|reload-config> [args]");
+                        sys_process::exit(1);
+                    }
+                }
             }
             "-a" | "--archive" => {
                 let staging_dir = args.next().into_iter().next().unwrap_or_default();
@@ -134,6 +197,9 @@ fn main() -> Result<()> {
                     install_cmd: "".into(),
                     links: None,
                     arch: "native".into(),
+                    components: None,
+                    services: None,
+                    binaries: None,
                 };
                 
                 let metadata = match ous::mtd(&mock_pkg, &dest_dir, &sum, &src_dir, "", &repo_root) {
@@ -149,6 +215,9 @@ fn main() -> Result<()> {
                         files: Vec::new(),
                         provides: None,
                         conflicts: None,
+                        components: Vec::new(),
+                        services: Vec::new(),
+                        binaries: Vec::new(),
                     }
                 };
 

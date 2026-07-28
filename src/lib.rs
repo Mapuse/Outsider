@@ -10,12 +10,43 @@ use sha2::{Digest, Sha256};
 use std::{collections::{HashMap, HashSet}, env, fs, io::Read, path::Path, path::PathBuf, process::Command};
 
 pub mod utils;
+pub mod plugin;
 use crate::utils::ui::UserInterface;
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Symlink {
     pub target: String,
     pub link: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ComponentSpec {
+    pub name: String,
+    #[serde(default = "default_priority")]
+    pub priority: String,
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_priority() -> String {
+    "optional".into()
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ServiceSpec {
+    pub name: String,
+    pub exec: String,
+    #[serde(default)]
+    pub requires: String,
+    #[serde(default = "default_restart")]
+    pub restart: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_restart() -> String {
+    "on-failure".into()
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -29,6 +60,12 @@ pub struct Package {
     pub links: Option<std::collections::HashMap<String, String>>,
     #[serde(default = "default_arch")]
     pub arch: String,
+    #[serde(default)]
+    pub components: Option<Vec<ComponentSpec>>,
+    #[serde(default)]
+    pub services: Option<Vec<ServiceSpec>>,
+    #[serde(default)]
+    pub binaries: Option<Vec<String>>,
 }
 
 fn default_arch() -> String {
@@ -62,6 +99,47 @@ pub struct PackageMetadata {
     pub files: Vec<PathBuf>,
     pub provides: Option<Vec<String>>,
     pub conflicts: Option<Vec<String>>,
+    #[serde(default)]
+    pub components: Vec<Component>,
+    #[serde(default)]
+    pub services: Vec<ServiceDecl>,
+    #[serde(default)]
+    pub binaries: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Component {
+    pub name: String,
+    pub priority: String,
+    pub files: Vec<PathBuf>,
+    #[serde(default)]
+    pub dependencies: Vec<ComponentDep>,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ComponentDep {
+    pub package: String,
+    pub component: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ServiceDecl {
+    pub name: String,
+    pub exec: String,
+    #[serde(default)]
+    pub requires: String,
+    #[serde(default = "default_restart")]
+    pub restart: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
+    #[serde(default)]
+    pub working_directory: String,
+    #[serde(default)]
+    pub socket: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -705,7 +783,7 @@ fn transitive(
 
 pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_content: &str, repo_root: &Path) -> Result<PackageMetadata> {
     let dependencies = scan(dest, log_content, pkg, repo_root)?;
-    let files = files(dest)?;
+    let pkg_files = files(dest)?;
     let provides = provides(dest)?;
 
     let target_type = env::var("OUS_HASH_TYPE").unwrap_or_else(|_| "sha256".to_string());
@@ -715,6 +793,26 @@ pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_conte
         .cloned()
         .unwrap_or_else(|| sum[0].clone());
 
+    let components = assign_components(&pkg_files, pkg);
+
+    let mut services: Vec<ServiceDecl> = Vec::new();
+    if let Some(ref specs) = pkg.services {
+        for s in specs {
+            services.push(ServiceDecl {
+                name: s.name.clone(),
+                exec: s.exec.clone(),
+                requires: s.requires.clone(),
+                restart: s.restart.clone(),
+                description: s.description.clone(),
+                environment: std::collections::HashMap::new(),
+                working_directory: String::new(),
+                socket: None,
+            });
+        }
+    }
+
+    let binaries: Vec<String> = pkg.binaries.clone().unwrap_or_default();
+
     Ok(PackageMetadata {
         pkg_name: pkg.name.clone(),
         version: pkg.version.clone(),
@@ -723,10 +821,81 @@ pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_conte
         arch: pkg.arch.clone(),
         checksum: selected,
         dependencies,
-        files: files.into_iter().map(PathBuf::from).collect(),
+        files: pkg_files.into_iter().map(PathBuf::from).collect(),
         provides: Some(provides), 
         conflicts: None::<Vec<String>>, 
+        components,
+        services,
+        binaries,
     })
+}
+
+pub fn assign_components(pkg_files: &[String], pkg: &Package) -> Vec<Component> {
+    let specs = match &pkg.components {
+        Some(specs) if !specs.is_empty() => specs.clone(),
+        _ => {
+            return vec![Component {
+                name: "core".to_string(),
+                priority: "required".to_string(),
+                files: pkg_files.iter().map(|f| PathBuf::from(f)).collect(),
+                dependencies: Vec::new(),
+                description: format!("Core files for {}", pkg.name),
+            }];
+        }
+    };
+
+    let mut assigned: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut unassigned_files: HashSet<String> = pkg_files.iter().cloned().collect();
+
+    for spec in &specs {
+        let mut matched = Vec::new();
+        for pattern in &spec.files {
+            for file in pkg_files {
+                if file == pattern || file.starts_with(pattern) {
+                    matched.push(PathBuf::from(file));
+                    unassigned_files.remove(file);
+                }
+            }
+        }
+        matched.sort();
+        matched.dedup();
+        assigned.insert(spec.name.clone(), matched);
+    }
+
+    if !unassigned_files.is_empty() {
+        let core_files: Vec<PathBuf> = unassigned_files.into_iter().map(PathBuf::from).collect();
+        let entry = assigned.entry("core".to_string()).or_insert_with(Vec::new);
+        entry.extend(core_files);
+        entry.sort();
+        entry.dedup();
+
+        if !specs.iter().any(|s| s.name == "core") {
+            UserInterface::warning(&format!(
+                "{} files not matched by any component; adding to 'core'", entry.len()
+            ));
+        }
+    }
+
+    let mut components: Vec<Component> = specs.iter().map(|spec| {
+        let files = assigned.get(&spec.name).cloned().unwrap_or_default();
+        Component {
+            name: spec.name.clone(),
+            priority: spec.priority.clone(),
+            files,
+            dependencies: Vec::new(),
+            description: spec.description.clone(),
+        }
+    }).collect();
+
+    let has_required = components.iter().any(|c| c.priority == "required");
+    if !has_required && !components.is_empty() {
+        if let Some(first) = components.first_mut() {
+            first.priority = "required".to_string();
+        }
+    }
+
+    components.sort_by(|a, b| a.name.cmp(&b.name));
+    components
 }
 
 pub fn meta(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_content: &str) -> Result<()> {
@@ -792,8 +961,26 @@ fn save_state(path: &Path, state: &BuildProgress) -> Result<()> {
 }
 
 pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
+    use crate::plugin::{PluginManager, PluginHook, PluginEvent};
+
     UserInterface::info(&format!("Processing package: {} v{}", pkg.name, pkg.version));
     let current_dir = env::current_dir()?;
+
+    let plugin_mgr = PluginManager::new(&current_dir);
+
+    let make_event = |hook: &str| -> PluginEvent {
+        PluginEvent {
+            hook: hook.to_string(),
+            package: Some(pkg.name.clone()),
+            version: Some(pkg.version.clone()),
+            source: Some(pkg.source.clone()),
+            build_type: Some(pkg.build_type.clone()),
+            work_dir: None,
+            root_dir: None,
+            output_path: None,
+            arch: Some(pkg.arch.clone()),
+        }
+    };
 
     let absolute_out_dir = current_dir.join(out_dir);
     fs::create_dir_all(&absolute_out_dir)?;
@@ -836,10 +1023,12 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
 
     if !state.completed_steps.contains("fetch") {
         UserInterface::info("Fetching package source...");
+        plugin_mgr.fire_hook(PluginHook::PreFetch, &make_event("pre-fetch"));
         fetch(&pkg.source, src_str).map_err(|e| {
             UserInterface::error(&format!("Fetch step failed: {}", e));
             anyhow!(e).context("Fetch step failed")
         })?;
+        plugin_mgr.fire_hook(PluginHook::PostFetch, &make_event("post-fetch"));
         state.completed_steps.insert("fetch".to_string());
         save_state(&state_path, &state)?;
     }
@@ -848,10 +1037,12 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         fs::read_to_string(&build_log_path).unwrap_or_default()
     } else {
         UserInterface::info("Building package modules...");
+        plugin_mgr.fire_hook(PluginHook::PreBuild, &make_event("pre-build"));
         let log = build(pkg, src_str).map_err(|e| {
             UserInterface::error(&format!("Build step failed: {}", e));
             anyhow!(e).context("Build step failed")
         })?;
+        plugin_mgr.fire_hook(PluginHook::PostBuild, &make_event("post-build"));
         fs::write(&build_log_path, &log)?;
         state.completed_steps.insert("build".to_string());
         save_state(&state_path, &state)?;
@@ -860,10 +1051,12 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
 
     if !state.completed_steps.contains("install") {
         UserInterface::info("Installing built files to root target...");
+        plugin_mgr.fire_hook(PluginHook::PreInstall, &make_event("pre-install"));
         install(pkg, src_str, root_str).map_err(|e| {
             UserInterface::error(&format!("Install step failed: {}", e));
             anyhow!(e).context("Install step failed")
         })?;
+        plugin_mgr.fire_hook(PluginHook::PostInstall, &make_event("post-install"));
         state.completed_steps.insert("install".to_string());
         save_state(&state_path, &state)?;
     }
@@ -874,10 +1067,12 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         })
     } else {
         UserInterface::info("Generating build checksum hash...");
+        plugin_mgr.fire_hook(PluginHook::PreHash, &make_event("pre-hash"));
         let s = hash(root_str).map_err(|e| {
             UserInterface::error(&format!("Hashing step failed: {}", e));
             anyhow!(e).context("Hashing step failed")
         })?;
+        plugin_mgr.fire_hook(PluginHook::PostHash, &make_event("post-hash"));
         fs::write(&sum_path, serde_json::to_string(&s)?)?;
         state.completed_steps.insert("hash".to_string());
         save_state(&state_path, &state)?;
@@ -886,6 +1081,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
 
     if !state.completed_steps.contains("metadata") {
         UserInterface::info("Compiling dependency graph and manifest metadata...");
+        plugin_mgr.fire_hook(PluginHook::PreMetadata, &make_event("pre-metadata"));
         let metadata = mtd(pkg, root_str, &sum, src_str, &build_log, current_dir.as_path()).map_err(|e| {
             UserInterface::error(&format!("Metadata generation failed: {}", e));
             anyhow!(e).context("Metadata generation failed")
@@ -898,16 +1094,19 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
             UserInterface::error(&format!("Repository index append failed: {}", e));
             anyhow!(e).context("Repository index generation failed")
         })?;
+        plugin_mgr.fire_hook(PluginHook::PostMetadata, &make_event("post-metadata"));
         state.completed_steps.insert("metadata".to_string());
         save_state(&state_path, &state)?;
     }
 
     if !state.completed_steps.contains("archive") {
         UserInterface::info("Compressing target root into final .xcs package...");
+        plugin_mgr.fire_hook(PluginHook::PreArchive, &make_event("pre-archive"));
         archive(root_str, &final_path).map_err(|e| {
             UserInterface::error(&format!("Archiving compression failed: {}", e));
             anyhow!(e).context("Archiving step failed")
         })?;
+        plugin_mgr.fire_hook(PluginHook::PostArchive, &make_event("post-archive"));
         state.completed_steps.insert("archive".to_string());
         save_state(&state_path, &state)?;
     }

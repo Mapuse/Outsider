@@ -1,6 +1,6 @@
 [package]
 name = "ous"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 
 [[bin]]
@@ -25,3 +25,4 @@ reqwest = { version = "0.13.3", features = ["blocking", "json"] }
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4.45"
 regex = "1.12.4"
+toml = "1.1"

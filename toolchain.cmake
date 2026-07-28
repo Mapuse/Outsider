@@ -1,9 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 include(CheckIncludeFile)
 
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+
 set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSROOT /home/m/cudane-build/rootfs)
-set(CMAKE_FIND_ROOT_PATH /home/m/cudane-build/rootfs/system)
+set(CMAKE_SYSROOT ${REPO_ROOT}/rootfs)
+set(CMAKE_FIND_ROOT_PATH ${REPO_ROOT}/rootfs/system)
 
 # ── Auto-detect host architecture ──────────────────────────────────────
 execute_process(
@@ -14,10 +16,10 @@ execute_process(
 
 if(CUDANE_HOST_ARCH STREQUAL "x86_64")
   set(CMAKE_SYSTEM_PROCESSOR x86_64)
-  set(CUDANE_GCC_TARGET x86_64-pc-linux-musl)
+  set(CUDANE_GCC_TARGET x86_64-unknown-linux-musl)
 elseif(CUDANE_HOST_ARCH STREQUAL "aarch64")
   set(CMAKE_SYSTEM_PROCESSOR aarch64)
-  set(CUDANE_GCC_TARGET aarch64-pc-linux-musl)
+  set(CUDANE_GCC_TARGET aarch64-unknown-linux-musl)
 else()
   message(FATAL_ERROR "Unsupported architecture: ${CUDANE_HOST_ARCH}. Supported: x86_64, aarch64")
 endif()

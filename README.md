@@ -591,7 +591,7 @@ make install DESTDIR=/mnt     # staged install
 ### Meson
 
 ```shell
-meson setup builddir --cross-file /home/m/cudane-build/cross.txt --prefix=/system
+meson setup builddir --cross-file cross.txt --prefix=/system
 meson compile -C builddir
 meson install -C builddir
 ```
@@ -1753,6 +1753,201 @@ This prints:
 10. **Archiving** (conditional): If the `archive` step is not marked complete, `archive()` compresses the `pkg/` directory into `<name>-<version>.xcs` using `tar` with Zstandard compression.
 
 11. **State Finalization**: After archiving, all steps are marked complete in `.state.json`. The next invocation will find the `.xcs` and skip the entire pipeline.
+
+</details>
+
+<details><summary id="development">Development</summary>
+
+## Building
+
+| Profile | Command | Flags | Use case |
+| ------- | ------- | ----- | -------- |
+| Debug | `cargo build` | — | Development iteration, fast compile |
+| Release | `cargo build --release` | `opt-level = 3`, `lto = true`, `strip = true` | Production binary, minimised size |
+| Check | `cargo check` | — | Compile-only verification, no artifacts |
+
+```shell
+# Compile-only verification (fastest)
+cargo check
+
+# Debug build
+cargo build
+
+# Release build (optimised for size)
+cargo build --release
+```
+
+## Installation
+
+All build systems auto-detect `x86_64`/`aarch64` and select the correct musl target. Cross-compilation files are in `env.mk`, `toolchain.cmake`, and `cross.txt` (generated via `gen-cross.sh`).
+
+### Cargo (direct)
+
+```shell
+cargo build --release
+# Binary: target/release/ous
+# Install:
+install -Dm755 target/release/ous /system/bin/ous
+```
+
+### Make
+
+```shell
+make build                    # auto-detects arch, builds for host
+make install                  # installs to /system/bin/ous
+make install DESTDIR=/mnt     # staged install
+```
+
+### Meson
+
+```shell
+meson setup builddir --cross-file cross.txt --prefix=/system
+meson compile -C builddir
+meson install -C builddir
+```
+
+### Ninja
+
+```shell
+ninja -f build.ninja                       # build
+ninja -f build.ninja install DESTDIR=/mnt  # staged install
+```
+
+### CMake
+
+```shell
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake -DCMAKE_INSTALL_PREFIX=/system
+cmake --build build
+cmake --install build
+```
+
+### MCX (package manager)
+
+```shell
+mcx -i outsider
+```
+
+**Dependencies:**
+
+| Crate | Purpose |
+|-------|---------|
+| serde | Serialization framework |
+| toml | TOML config file parser |
+| dirs | Platform-specific config paths |
+| glob | File glob pattern matching |
+| libc | POSIX syscall bindings |
+| serde_json | JSON serialization |
+| crossterm | Terminal raw mode, events, colors |
+| sha2 | Cryptographic hashing |
+| chrono | Timestamp generation |
+| regex | License pattern matching |
+| anyhow | Error handling with context |
+
+## Testing
+
+```shell
+# Run all tests (unit + integration)
+cargo test
+
+# Run with stdout/stderr visible
+cargo test -- --nocapture
+
+# Run a specific test by name
+cargo test -- test_name
+
+# Run with all features and release mode
+cargo test --release --all-features
+```
+
+## Linting
+
+```shell
+# Clippy (lint checks)
+cargo clippy -- -D warnings
+
+# Format check
+cargo fmt --check
+
+# Format in place
+cargo fmt
+```
+
+## Auditing
+
+```shell
+# Check for security advisories in dependencies
+cargo audit
+```
+
+## Debugging
+
+```shell
+# Build with debug assertions enabled in release
+cargo build --profile release-debug  # requires Cargo.toml profile
+
+# Run with RUST_LOG for tracing
+RUST_LOG=debug ous
+
+# Run with backtrace on panic
+RUST_BACKTRACE=1 ous
+
+# Run under strace for syscall tracing
+strace -f -o /tmp/ous.strace ./target/release/ous
+
+# Memory profiling with valgrind
+valgrind --tool=massif ./target/release/ous
+ms_print massif.out.* | less
+```
+
+## Profiling
+
+```shell
+# perf profiling (Linux)
+perf record --call-graph dwarf ./target/release/ous
+perf report
+
+# Generate flamegraph
+perf script | inferno-collapse-perf > stacks.folded
+inferno-flamegraph stacks.folded > flamegraph.svg
+
+# CPU sampling with perf stat
+perf stat -e cycles,instructions,cache-misses,faults ./target/release/ous
+```
+
+## Continuous integration
+
+```yaml
+# Expected CI pipeline (GitHub Actions)
+steps:
+  - name: Checkout
+    run: git checkout ${{ github.ref }}
+
+  - name: Build
+    run: cargo build --release
+
+  - name: Test
+    run: cargo test --release
+
+  - name: Lint
+    run: cargo clippy -- -D warnings
+
+  - name: Format
+    run: cargo fmt --check
+
+  - name: Audit
+    run: cargo audit
+```
+
+## Cargo.toml release profile
+
+```toml
+[profile.release]
+opt-level = 3         # Optimise for speed
+lto = true            # Link-time optimisation
+strip = true          # Strip symbols
+```
+
+---
 
 </details>
 

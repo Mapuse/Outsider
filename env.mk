@@ -1,19 +1,19 @@
-CUDANE_BUILD  := /home/m/cudane-build
-SYSROOT       := $(CUDANE_BUILD)/rootfs
-PREFIX        := /system
+REPO_ROOT   := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+SYSROOT     := $(REPO_ROOT)/rootfs
+PREFIX      ?= /system
 
 # ── Auto-detect host architecture ──────────────────────────────────────
 HOST_ARCH_RAW := $(shell uname -m)
 ifeq ($(HOST_ARCH_RAW),x86_64)
   ARCH         := amd64
   RUST_TARGET  := x86_64-unknown-linux-musl
-  GCC_TARGET   := x86_64-pc-linux-musl
+  GCC_TARGET   := x86_64-unknown-linux-musl
   CMAKE_ARCH   := x86_64
   MESON_CPU    := x86_64
 else ifeq ($(HOST_ARCH_RAW),aarch64)
   ARCH         := arm64
   RUST_TARGET  := aarch64-unknown-linux-musl
-  GCC_TARGET   := aarch64-pc-linux-musl
+  GCC_TARGET   := aarch64-unknown-linux-musl
   CMAKE_ARCH   := aarch64
   MESON_CPU    := aarch64
 else

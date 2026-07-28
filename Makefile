@@ -1,4 +1,4 @@
-include /home/m/cudane-build/env.mk
+include env.mk
 
 PROFILE ?= release
 TARGET  := target/$(RUST_TARGET)/$(PROFILE)/ous

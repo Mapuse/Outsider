@@ -1960,7 +1960,8 @@ strip = true          # Strip symbols
 
 <details><summary id="credits">Credits</summary>
 
-[[**`Myden`**]](https://codeberg.org/myden): **`Cudane`**, **`MCX`** and **`Outsider`** Founder - Made with 🤍 and **Rust**.
+**`Cudane`**
+**`MCX`**
 
 </details>
 

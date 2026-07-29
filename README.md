@@ -1,6 +1,4 @@
-`▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
-
-#
+##
 
 ```shell
  ██████╗ ██╗   ██╗████████╗███████╗██╗██████╗ ███████╗██████╗ 
@@ -20,11 +18,9 @@
 
 ##
 
-`▐▄` `-` `▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▌`
-
 `▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
 
-**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for the **Cudane** Linux ecosystem (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into `.xcs` binary packages, and automatically writes per-architecture **`index.<arch>.json`** files for your own repository of packages (with auto-updating support). It detects Cesar service files, multi-service declarations, binary entries, and component tiers — writing all of this into the package metadata for MCX to consume.
+**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for **`Cudane**`** (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into **`.xcs`** binary packages, and automatically writes per-architecture **`index.<arch>.json`** files for your own repository of packages (with auto-updating support). It detects **`Cesar`** service files, multi-service declarations, binary entries, and component tiers — writing all of this into the package metadata for **`MCX`** to consume.
 
 - **`Version`:** **`0.7.0`**.
 

@@ -3,17 +3,17 @@ c = 'clang'
 cpp = 'clang++'
 ar = 'llvm-ar'
 strip = 'llvm-strip'
-pkg-config = '/home/m/cudane-build/rootfs/../cudane-pkg-config.sh'
+pkg-config = './pkgconfig.sh'
 rust = 'rustc'
 
 [properties]
-sys_root = '/home/m/cudane-build/rootfs'
+sys_root = '/'
 
 [built-in options]
-c_args = ['-target', 'x86_64-pc-linux-musl', '-O2', '-Wno-undef', '-stdlib=libc++', '-I/home/m/cudane-build/rootfs/system/include', '-I/home/m/cudane-build/rootfs/system/include/libxml2', '-mllvm', '-polly', '-mllvm', '-polly-ast-use-expr-compiler', '-mllvm', '-polly-vectorizer=stripmine', '-flto']
-cpp_args = ['-O3', '-target', 'x86_64-pc-linux-musl', '-Wno-undef', '-stdlib=libc++', '-mllvm', '-polly', '-mllvm', '-polly-ast-use-expr-compiler', '-mllvm', '-polly-vectorizer=stripmine', '-flto', '-I/home/m/cudane-build/rootfs/system/include', '-I/home/m/cudane-build/rootfs/system/include/libxml2']
-c_link_args = ['-target', 'x86_64-pc-linux-musl', '-L/home/m/cudane-build/rootfs/system/lib']
-cpp_link_args = ['-target', 'x86_64-pc-linux-musl', '-L/home/m/cudane-build/rootfs/system/lib']
+c_args = ['-target', 'x86_64-unknown-linux-musl', '-O2', '-Wno-undef', '-stdlib=libc++', '-I-/system/include', '-I/system/include/libxml2', '-mllvm', '-polly', '-mllvm', '-polly-ast-use-expr-compiler', '-mllvm', '-polly-vectorizer=stripmine', '-flto']
+cpp_args = ['-O3', '-target', 'x86_64-unknown-linux-musl', '-Wno-undef', '-stdlib=libc++', '-mllvm', '-polly', '-mllvm', '-polly-ast-use-expr-compiler', '-mllvm', '-polly-vectorizer=stripmine', '-flto', '-I/system/include', '-I/system/include/libxml2']
+c_link_args = ['-target', 'x86_64-unknown-linux-musl', '-L/system/lib']
+cpp_link_args = ['-target', 'x86_64-unknown-linux-musl', '-L/system/lib']
 
 [host_machine]
 system = 'linux'

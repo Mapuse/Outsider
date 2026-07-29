@@ -4,6 +4,7 @@ cpp = 'clang++'
 ar = 'llvm-ar'
 strip = 'llvm-strip'
 pkg-config = '/home/m/cudane-build/rootfs/../cudane-pkg-config.sh'
+rust = 'rustc'
 
 [properties]
 sys_root = '/home/m/cudane-build/rootfs'

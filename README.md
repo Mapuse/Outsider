@@ -1953,9 +1953,8 @@ strip = true          # Strip symbols
 
 <details><summary id="license">License</summary>
 
-## The Unlicense
-
-see [**`LICENSE`**](https://codeberg.org/Cudane/Outsider/src/branch/master/LICENSE) file for details.
+## License
+**MIT License** ─ See [[**`LICENSE`**](https://github.com/Mapuse/Outsider/blob/master/LICENSE)] for More Details.
 
 </details>
 

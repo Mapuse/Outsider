@@ -6,54 +6,49 @@
 ██║   ██║██║   ██║   ██║   ███████╗██║██║  ██║█████╗  ██████╔╝
 ██║   ██║██║   ██║   ██║   ╚════██║██║██║  ██║██╔══╝  ██╔══██╗
 ╚██████╔╝╚██████╔╝   ██║   ███████║██║██████╔╝███████╗██║  ██║
- ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝
-                                                              
- ██╗ ██████╗ ██╗   ██╗███████╗██╗                             
-██╔╝██╔═══██╗██║   ██║██╔════╝╚██╗                            
-██║ ██║   ██║██║   ██║███████╗ ██║                            
-██║ ██║   ██║██║   ██║╚════██║ ██║                            
-╚██╗╚██████╔╝╚██████╔╝███████║██╔╝                            
- ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝╚═╝                             
+ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝                      
 ```
 
 ##
 
 `▐▀` `-` `▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▌`
 
-**Outsider (`OUS`)** is an automated source-to-archive build engine designed specifically for **`Cudane**`** (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into **`.xcs`** binary packages, and automatically writes per-architecture **`index.<arch>.json`** files for your own repository of packages (with auto-updating support). It detects **`Cesar`** service files, multi-service declarations, binary entries, and component tiers — writing all of this into the package metadata for **`MCX`** to consume.
+**`[Outsider]`** (`OUS`) is an automated source-to-archive build engine designed specifically for **`[Cudane]`** (also available for GNU-based distributions). It reads declarative JSON manifests that can contain an unlimited number of package recipes, isolates execution within localized workspaces, builds whatever target you want from source, scans dependencies, packages everything cleanly into **`[.xcs]`** binary packages, and automatically writes per-architecture **`[index.<arch>.json]`** files for your own repository of packages (with auto-updating support). It detects **`[Cesar]`** service files, multi-service declarations, binary entries, and component tiers — writing all of this into the package metadata for **`[MCX]`** to consume.
 
-- **`Version`:** **`0.7.0`**.
+- **`Version`**: **`[0.7.0]`**
 
 `▐▄` `-` `▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▌`
 
 <details><summary id="contents">Contents</summary>
 
-- [Architecture]
-- [Manifest]
-- [Packages]
-- [Symlinks]
-- [Metadata]
-- [Consolidation]
-- [Entry]
-- [Core]
-- [Binary Reader]
-  - [ELF Target Iterator]
-  - [Dynamic Symbol Parser]
-  - [Dependency Matcher]
-  - [Metadata Synchronization & Dependency Signature]
-  - [Resolution by ldd]
-- [Build / Resume]
-- [Starting]
-- [Guide]
-- [CLI]
-- [Format]
-- [Indexing]
-- [Requirements]
-- [Cudane]
-- [Manualizing]
-- [Lifecycle]
-- [License]
-- [Credits]
+## Table of Contents
+
+- [**`[Architecture]`**](#arch)
+- [**`[Manifest]`**](#manifest)
+- [**`[Packages]`**](#packages)
+- [**`[Symlinks]`**](#symlinks)
+- [**`[Metadata]`**](#metadatah)
+- [**`[Consolidation]`**](#lib-consolidation)
+- [**`[Entry]`**](#entry)
+- [**`[Core]`**](#core)
+- [**`[Binary Reader]`**](#binary-reader)
+  - [**`[ELF]`**](#elf-target-iterator)
+  - [**`[Dynamic Symbol Parser]`**](#dynamic-symbol-parser)
+  - [**`[Dependency Matcher]`**](#dependency-matcher)
+  - [**`[Metadata & Signature]`**](#metadata-synchronization--dependency-signature)
+  - [**`[Resolution by ldd]`**](#resolution-by-ldd)
+- [**`[Build / Resume]`**](#build--resume)
+- [**`[Starting]`**](#starting)
+- [**`[Guide]`**](#guide)
+- [**`[CLI]`**](#cli)
+- [**`[Format]`**](#format)
+- [**`[Indexing]`**](#indexing)
+- [**`[Requirements]`**](#requirements)
+- [**`[Cudane]`**](#cudane)
+- [**`[Manualizing]`**](#manualizing)
+- [**`[Lifecycle]`**](#lifecycle)
+- [**`[License]`**](#license)
+- [**`[Credits]`**](#credits)
 
 </details>
 
@@ -63,10 +58,10 @@
 
 The codebase is split into two files:
 
-- **`src/main.rs`** — The CLI argument parser and entry point. It parses command-line flags, reads the manifest, and iterates over each package, calling into the library.
-- **`src/lib.rs`** — The core engine. Contains all data structures, the fetch/build/install pipeline, metadata generation, dependency injection, license detection, hashing, archiving, component scanning, service detection, sandbox profiling, repository indexing, and the **Binary Reader** dependency scanner.
+- [**`src/main.rs`**] — The CLI argument parser and entry point. It parses command-line flags, reads the manifest, and iterates over each package, calling into the library.
+- [**`src/lib.rs`**] — The core engine. Contains all data structures, the fetch/build/install pipeline, metadata generation, dependency injection, license detection, hashing, archiving, component scanning, service detection, sandbox profiling, repository indexing, and the **Binary Reader** dependency scanner.
 
-The engine uses **`anyhow`** for error handling with context propagation, **`serde`** for JSON serialization and deserialization, **`sha2`** for cryptographic hashing, **`chrono`** for timestamp generation, and **`regex`** for license pattern matching. External system tools (`git`, `curl`, `tar`, `ldd`, `file`) are invoked via `std::process::Command` rather than being linked as libraries, keeping the Rust binary lightweight and delegating specialized work to mature system utilities.
+The engine uses [**`anyhow`**] for error handling with context propagation, [**`serde`**] for JSON serialization and deserialization, [**`sha2`**] for cryptographic hashing, [**`chrono`**] for timestamp generation, and [**`regex`**] for license pattern matching. External system tools (`git`, `curl`, `tar`, `ldd`, `file`) are invoked via `std::process::Command` rather than being linked as libraries, keeping the Rust binary lightweight and delegating specialized work to mature system utilities.
 
 </details>
 
@@ -239,16 +234,16 @@ pub struct PackageMetadata {
 
 Each field is populated as follows:
 
-- **`pkg_name`**: Mirrored directly from the manifest's `name` field.
-- **`version`**: Mirrored directly from the manifest's `version` field.
-- **`source`**: Mirrored directly from the manifest's `source` field.
-- **`arch`**: Mirrored directly from the manifest's `arch` field. Defaults to `""` when absent (backward compat with older metadata).
-- **`license`**: Determined by the `license()` function, which scans the source directory for license files and extracts the license name using regex pattern matching.
-- **`build_type`**: Mirrored directly from the manifest's `build_type` field.
-- **`build_date`**: An ISO 8601 UTC timestamp generated at runtime via `chrono::Utc::now().to_rfc3339()`, recording exactly when the metadata was created.
-- **`checksum`**: A SHA-256 hex digest of the entire package staging directory, computed by `hash()` which pipes the directory through `tar -cf -` and hashes the resulting byte stream.
-- **`provides`**: Using `libdep` and `normalize` to list the libraries that the package provides.
-- **`conflicts`**: Using `scan` to scan for any conflicting links and list it.
+- [**`pkg_name`**]: Mirrored directly from the manifest's `name` field.
+- [**`version`**]: Mirrored directly from the manifest's `version` field.
+- [**`source`**]: Mirrored directly from the manifest's `source` field.
+- [**`arch`**]: Mirrored directly from the manifest's `arch` field. Defaults to `""` when absent (backward compat with older metadata).
+- [**`license`**]: Determined by the `license()` function, which scans the source directory for license files and extracts the license name using regex pattern matching.
+- [**`build_type`**]: Mirrored directly from the manifest's `build_type` field.
+- [**`build_date`**]: An ISO 8601 UTC timestamp generated at runtime via `chrono::Utc::now().to_rfc3339()`, recording exactly when the metadata was created.
+- [**`checksum`**]: A SHA-256 hex digest of the entire package staging directory, computed by `hash()` which pipes the directory through `tar -cf -` and hashes the resulting byte stream.
+- [**`provides`**]: Using `libdep` and `normalize` to list the libraries that the package provides.
+- [**`conflicts`**]: Using `scan` to scan for any conflicting links and list it.
 
 ### Dependency
 
@@ -264,13 +259,13 @@ pub struct Dependency {
 }
 ```
 
-- **`name`**: The name of the depended-on package (or a raw library name if the library could not be mapped to any known package).
-- **`dep_type`**: A human-readable description of how the dependency was discovered. Values include:
+- [**`name`**]: The name of the depended-on package (or a raw library name if the library could not be mapped to any known package).
+- [**`dep_type`**]: A human-readable description of how the dependency was discovered. Values include:
   - `"Build"` — discovered from build log parsing (e.g., `pkg-config --libs foo`, `checking for foo...`, `dependency foo found`)
   - `"Library (libfoo.so.1)"` — discovered by scanning ELF binaries in the staging directory and resolving the library to a known package
   - `"Library"` — a raw library that could not be mapped to any known package in the workspace
   - `"Transitive"` — discovered via transitive dependency resolution against the repository index
-- **`libraries`** (optional): If the dependency on a single package arises from **2 or more distinct libraries** (all provided by the same package), this field lists those specific library names. This is the **Consolidation** feature — see the [Consolidation] section.
+- [**`libraries`**] (optional): If the dependency on a single package arises from **2 or more distinct libraries** (all provided by the same package), this field lists those specific library names. This is the **Consolidation** feature — see the [Consolidation] section.
 
 The `PartialEq` derive is used by `index()` to compare metadata entries and avoid unnecessary updates when the content has not changed.
 
@@ -1018,7 +1013,7 @@ pub fn checksum_index(index_path: &str, pkg_dir: &str, base_url: &str, arch: &st
 
 Computes SHA-256 checksums for each `.xcs` file and updates the corresponding index entry. Simultaneously rewrites the `source` URL to point to the pool path: `<base_url>/pool/<arch>/<name>/<name>-<version>.xcs`.
 
-**Usage:** `ous --checksum index.x86_64.json pool/ --base-url https://raw.codeberg.org/Cudane/Repository --arch x86_64`
+**Usage:** `ous --checksum index.x86_64.json pool/ --base-url https://github.com/Mapuse/MCX --arch x86_64`
 
 ## rewrite_source - URL Rewriting
 
@@ -1028,7 +1023,7 @@ pub fn rewrite_source(index_path: &str, base_url: &str, arch: &str) -> Result<()
 
 Rewrites the `source` field in every index entry to point to the pool path without computing checksums. Useful when only URLs need updating.
 
-**Usage:** `ous --source index.x86_64.json --base-url https://raw.codeberg.org/Cudane/Repository --arch x86_64`
+**Usage:** `ous --source index.x86_64.json --base-url https://github.com/Mapuse/MCX --arch x86_64`
 
 ## sign_packages - GPG Signing
 
@@ -1074,7 +1069,7 @@ The following step identifiers are tracked:
 2. If the file exists and `OUS_CLEAN` is **not** set, the state is loaded and only steps **not** in `completed_steps` are executed.
 3. After each successful step, the state file is updated atomically (written via `serde_json` + `fs::write`).
 4. Intermediate outputs are persisted:
-   - Build log → `build_log.txt`
+   - Build log → `ous.log`
    - Checksums → `checksums.json`
 
 ### Overwrite / Force
@@ -1111,7 +1106,7 @@ This is the main orchestrator function that ties together the entire build pipel
     - `src/` — Where source code is fetched and built.
     - `pkg/` — Where installed artifacts are staged before archiving.
     - `.state.json` — State file tracking completed build steps (see [Build / Resume]).
-    - `build_log.txt` — Persisted build log for dependency re-scanning on resume.
+    - `ous.log` — Persisted build log for dependency re-scanning on resume.
     - `checksums.json` — Persisted checksum results for resume.
 
 4. **State loading / workspace initialization**:
@@ -1120,7 +1115,7 @@ This is the main orchestrator function that ties together the entire build pipel
 
 5. **Source fetch**: `fetch(&pkg.source, src_str)` is called to populate the `src/` directory if the `fetch` step is not marked complete. If the step was already completed (from a previous partial run), it is skipped.
 
-6. **Build execution**: `build(pkg, src_str)` is called to compile the source if the `build` step is not marked complete. The build log is saved to `build_log.txt` for potential resume. On resume, if the build is complete, the log is read from disk.
+6. **Build execution**: `build(pkg, src_str)` is called to compile the source if the `build` step is not marked complete. The build log is saved to `ous.log` for potential resume. On resume, if the build is complete, the log is read from disk.
 
 7. **Installation**: `install(pkg, src_str, root_str)` is called to copy built artifacts into the `pkg/` staging directory if the `install` step is not marked complete.
 
@@ -1142,9 +1137,9 @@ This is the main orchestrator function that ties together the entire build pipel
 
 </details>
 
-<details><summary id="plugin">Python Plugin System</summary>
+<details><summary id="plugin">Python Subsystem</summary>
 
-## Python Plugin System
+## Python Subsystem
 
 Outsider uses a TOML configuration file at `etc/ous/p.desc` to define plugins. The plugin system is **completely open** — any Python code is accepted. The only validation is a syntax check (`python3 -c "compile(...)"`). There are no restrictions on what your plugin can do.
 
@@ -1209,6 +1204,7 @@ Run any alias via:
 
 ```shell
 ous --plugin run <plugin-name> <alias-name>
+
 # Example:
 ous --plugin run tools build-all
 ous --plugin run tools deploy
@@ -1519,8 +1515,8 @@ rustflags = ["-C", "target-cpu=armv8-a", ...]
 
 ### Engine Integration
 
-- **`Package.arch`** — Set per-package in the manifest (defaults to `"native"` for backward compatibility).
-- **`OUS_TARGET`** — Environment variable read by the auto Rust build to determine the `--target` triple.
+- [**`Package.arch`**] — Set per-package in the manifest (defaults to `"native"` for backward compatibility).
+- [**`OUS_TARGET`**] — Environment variable read by the auto Rust build to determine the `--target` triple.
 - **Arch-aware workspace** — Each arch gets its own workspace at `.os/<pkg>/<arch>/` to avoid rebuild conflicts when building the same package for multiple architectures.
 - **Arch-specific index** — `index()` writes `index.<arch>.json` when the architecture is set, keeping per-arch metadata separate.
 
@@ -1534,12 +1530,12 @@ Because `Outsider` delegates specialized operations to highly optimized system-l
 | --- | --- |
 | **Rust Toolchain** | Required to build the core `Outsider` compiler itself, alongside fallback execution of `cargo` for `rust` build-types. |
 | **`sh` (POSIX Shell)** | Executing custom user-defined build and install command hooks dynamically. |
-| **`git`** | Managing external source code repositories via rapid depth-restricted clones. |
-| **`curl`** | Handling remote archive downloads with robust error and status tracking. |
-| **`tar`** | Extracting source assets, staging layout tracking, and processing intermediate streams. |
-| **`zstd`** | Compression backend used by `tar` |
-| **`ldd`** | Phase 1 of the two-phase dependency scan: captures compile-time DT_NEEDED entries. |
-| **`file`** | Used by the `-i`/`--inspect` flag to determine the file type of a package. |
+| [**`git`**] | Managing external source code repositories via rapid depth-restricted clones. |
+| [**`curl`**] | Handling remote archive downloads with robust error and status tracking. |
+| [**`tar`**] | Extracting source assets, staging layout tracking, and processing intermediate streams. |
+| [**`zstd`**] | Compression backend used by `tar` |
+| [**`ldd`**] | Phase 1 of the two-phase dependency scan: captures compile-time DT_NEEDED entries. |
+| [**`file`**] | Used by the `-i`/`--inspect` flag to determine the file type of a package. |
 
 </details>
 
@@ -1571,7 +1567,7 @@ CC=\"clang --target x86_64-unknown-linux-musl -march=x86-64-v3 -O3 -flto=full -s
 * `-static`: Guarantees absolute static linking with `musl-libc`, outputting a sovereign, self-contained binary entirely free of runtime dynamic dependencies.
 * `--sysroot=$DESTDIR/system`: Injected directly inside the compiler definition string to redirect the Clang link editor and preprocessor header mechanics to the Systemfs filesystem tree (`/system` - alternative to `/usr`).
 
-Make sure that you have been set up the `$DESTDIR` variable befor start building, see [[`Starting`](#starting)] section for more informations about setting the building variable.
+Make sure that you have been set up the `$DESTDIR` variable befor start building, see [[**`Starting`**](#starting)] section for more informations about setting the building variable.
 
 ### 3. Rust Targets
 
@@ -1734,7 +1730,7 @@ This prints:
 
 4. **Source Fetching** (conditional): If the `fetch` step is not marked complete in the state file, `fetch()` retrieves the source code into `src/` using the appropriate method (local copy, git clone, or curl+tar download). On success, the state file is updated.
 
-5. **Build Execution** (conditional): If the `build` step is not marked complete, `build()` executes the build command in the `src/` directory. For Rust packages with empty `build_cmd`, automatic `cargo build --release` is triggered with Cudane-specific flags. The build log is persisted to `build_log.txt` for resume.
+5. **Build Execution** (conditional): If the `build` step is not marked complete, `build()` executes the build command in the `src/` directory. For Rust packages with empty `build_cmd`, automatic `cargo build --release` is triggered with Cudane-specific flags. The build log is persisted to `ous.log` for resume.
 
 6. **Installation** (conditional): If the `install` step is not marked complete, `install()` copies built artifacts from `src/` to `pkg/`. For Rust packages with empty `install_cmd`, files from `target/release/` are automatically copied.
 
@@ -1953,16 +1949,13 @@ strip = true          # Strip symbols
 
 </details>
 
-<details><summary id="license">License</summary>
+## Credits
+
+**`[Outsider]`** is part of the **`[Cudane]`** ecosystem.
+
+- **`[Cudane]`** — The Distribution.
+- **`[MCX]`** — Package Manager.
 
 ## License
-**MIT License** ─ See [[**`LICENSE`**](https://github.com/Mapuse/Outsider/blob/master/LICENSE)] for More Details.
 
-</details>
-
-<details><summary id="credits">Credits</summary>
-
-**`Cudane`**
-**`MCX`**
-
-</details>
+**MIT License** ─ See [**`[LICENSE]`**](https://github.com/Mapuse/Outsider/blob/master/LICENSE) for More Details.

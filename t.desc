@@ -1,0 +1,22 @@
+# Outsider Theme Descriptor
+# Register themes for the Outsider build engine.
+# Each [theme.<id>] section defines one theme.
+# - name:  display name (shown in `ous --theme list`)
+# - path:  path to the Python theme file (absolute or ~ expanded)
+# - description: optional human-readable description
+#
+# A theme file is a single .py module that may define:
+#   render_prompt(**context)      -> dict | str
+#   render_right_prompt(**context) -> str
+#   render_command_summary(**context) -> str
+#   run()                         -> bool   (TUI mode)
+
+[theme.outsider]
+name = "Outsider"
+path = "~/Outsider/themes/outsider.py"
+description = "Default Outsider theme — violet accent, build-aware prompt"
+
+[theme.minimal]
+name = "Minimal"
+path = "~/Outsider/themes/minimal.py"
+description = "Minimal single-line prompt with exit-code indicator"

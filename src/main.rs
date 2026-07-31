@@ -1,13 +1,21 @@
+pub mod config;
 pub mod utils;
+pub mod python;
+pub mod event;
 
 use crate::utils::ui::UserInterface;
 
 use anyhow::{anyhow, Result};
 use ous::{process, Manifest, PackageMetadata};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::process as sys_process;
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1).peekable();
@@ -38,6 +46,7 @@ fn main() -> Result<()> {
                 println!("  -z, --zstd-level <NUM>       Set zstd compression level (default: 3)");
                 println!("  -s, --strict                 Fail immediately on dependency mapping errors");
                 println!("  -d, --debug                  Enable verbose debug logging");
+                println!("  -q, --quiet                  Suppress non-error output");
                 println!("  -y, --yes                    Assume 'yes' to all prompts");
                 println!("  -k, --keep-src               Do not delete source directory after build");
                 println!("  -p, --project <DIR>          Define custom project/workspace directory");
@@ -56,11 +65,19 @@ fn main() -> Result<()> {
                 println!("    --base-url <URL>           Base URL for source rewriting (with --source)");
                 println!("  -g, --sign <INDEX> <DIR>     GPG sign index + all .xcs packages");
                 println!("    --key <KEYID>              GPG key ID for signing (with --sign)");
-                utils::UserInterface::info("PLUGIN:");
-                println!("  --plugin list            List loaded plugins");
-                println!("  --plugin run <name> <alias>  Run a plugin alias");
-                println!("  --plugin reload           Re-scan plugins directory");
-                println!("  --plugin reload-config    Reload from p.desc TOML config");
+                utils::UserInterface::info("PLUGIN / THEME / TUI:");
+                println!("  --plugin list               List registered plugins");
+                println!("  --plugin register <name> <path>  Register a new plugin");
+                println!("  --plugin unregister <name>  Remove a plugin");
+                println!("  --plugin run <name> <func> [args]  Run a plugin function");
+                println!("  --theme list                List registered themes");
+                println!("  --theme register <name> <path>  Register a theme");
+                println!("  --theme unregister <name>   Remove a theme");
+                println!("  --theme apply <name>        Apply a theme");
+                println!("  --tui list                  List registered TUI apps");
+                println!("  --tui register <name> <path>   Register a TUI app");
+                println!("  --tui unregister <name>     Remove a TUI app");
+                println!("  --tui run <name>            Run a TUI app");
                 println!("  -v, --version                Print version information");
                 sys_process::exit(0);}
             "-v" | "--version" => {
@@ -69,58 +86,171 @@ fn main() -> Result<()> {
             }
             "--plugin" => {
                 let sub = args.next().unwrap_or_default();
-                let cwd = env::current_dir()?;
-                let plugin_mgr = ous::plugin::PluginManager::new(&cwd);
                 match sub.as_str() {
                     "list" => {
-                        let list = plugin_mgr.list();
-                        if list.is_empty() {
-                            UserInterface::info("No plugins loaded.");
+                        let plugins = python::plugin::PluginManager::list();
+                        if plugins.is_empty() {
+                            utils::UserInterface::info("No plugins registered.");
                         } else {
-                            for p in &list {
-                                let aliases: Vec<&str> = p.aliases.keys().map(|s| s.as_str()).collect();
-                                let alias_str = if aliases.is_empty() { String::new() } else { format!(" [aliases: {}]", aliases.join(", ")) };
-                                UserInterface::info(&format!("  {} ({}){}", p.name(), p.path().display(), alias_str));
+                            for p in &plugins {
+                                let alias_str = if p.aliases.is_empty() { String::new() } else { format!(" [aliases: {}]", p.aliases.keys().cloned().collect::<Vec<_>>().join(", ")) };
+                                utils::UserInterface::info(&format!("  {} ({}){}", p.name, p.path, alias_str));
                             }
                         }
                         sys_process::exit(0);
                     }
-                    "run" => {
+                    "register" => {
                         let name = args.next().unwrap_or_default();
-                        let alias = args.next().unwrap_or_default();
-                        if name.is_empty() || alias.is_empty() {
-                            UserInterface::error("Usage: ous -p run <plugin-name> <alias>");
+                        let path = args.next().unwrap_or_default();
+                        if name.is_empty() || path.is_empty() {
+                            utils::UserInterface::error("Usage: ous --plugin register <name> <path>");
                             sys_process::exit(1);
                         }
-                        match plugin_mgr.find(&name) {
-                            Some(p) => match p.run_alias(&alias) {
-                                Ok(result) => {
-                                    if let Some(msg) = &result.message {
-                                        println!("{}", msg);
-                                    }
-                                    if !result.success { sys_process::exit(1); }
-                                }
-                                Err(e) => { UserInterface::error(&format!("{}", e)); sys_process::exit(1); }
-                            },
-                            None => { UserInterface::error(&format!("Plugin '{}' not found", name)); sys_process::exit(1); }
+                        python::plugin::PluginManager::register(&name, Path::new(&path), &HashMap::new());
+                        utils::UserInterface::success(&format!("Plugin '{}' registered", name));
+                        sys_process::exit(0);
+                    }
+                    "unregister" => {
+                        let name = args.next().unwrap_or_default();
+                        if name.is_empty() {
+                            utils::UserInterface::error("Usage: ous --plugin unregister <name>");
+                            sys_process::exit(1);
                         }
+                        python::plugin::PluginManager::unregister(&name);
+                        utils::UserInterface::success(&format!("Plugin '{}' unregistered", name));
                         sys_process::exit(0);
                     }
-                    "reload" => {
-                        plugin_mgr.reload(&cwd);
-                        let count = plugin_mgr.list().len();
-                        UserInterface::success(&format!("Loaded {} plugin(s)", count));
-                        sys_process::exit(0);
-                    }
-                    "reload-config" => {
-                        match plugin_mgr.reload_from_config(&cwd) {
-                            Ok(n) => { UserInterface::success(&format!("Loaded {} new plugin(s)", n)); }
-                            Err(e) => { UserInterface::error(&format!("{}", e)); sys_process::exit(1); }
+                    "run" => {
+                        let name = args.next().unwrap_or_default();
+                        let func = args.next().unwrap_or("main".into());
+                        let rest: Vec<String> = args.collect();
+                        if name.is_empty() {
+                            utils::UserInterface::error("Usage: ous --plugin run <name> <func> [args]");
+                            sys_process::exit(1);
+                        }
+                        match python::plugin::PluginManager::by_name(&name) {
+                            Some(entry) => match python::plugin::PluginManager::run(&entry, &func, &rest) {
+                                Ok(out) => { println!("{}", out); }
+                                Err(e) => { utils::UserInterface::error(&e); sys_process::exit(1); }
+                            },
+                            None => { utils::UserInterface::error(&format!("Plugin '{}' not found", name)); sys_process::exit(1); }
                         }
                         sys_process::exit(0);
                     }
                     _ => {
-                        UserInterface::error("Usage: ous -p <list|run|reload|reload-config> [args]");
+                        utils::UserInterface::error("Usage: ous --plugin <list|register|unregister|run> [args]");
+                        sys_process::exit(1);
+                    }
+                }
+            }
+            "--theme" => {
+                let sub = args.next().unwrap_or_default();
+                match sub.as_str() {
+                    "list" => {
+                        let themes = python::theme::ThemeEngine::list();
+                        if themes.is_empty() {
+                            utils::UserInterface::info("No themes registered.");
+                        } else {
+                            for t in &themes {
+                                utils::UserInterface::info(&format!("  {} ({})", t.name, t.path));
+                            }
+                        }
+                        sys_process::exit(0);
+                    }
+                    "register" => {
+                        let name = args.next().unwrap_or_default();
+                        let path = args.next().unwrap_or_default();
+                        if name.is_empty() || path.is_empty() {
+                            utils::UserInterface::error("Usage: ous --theme register <name> <path>");
+                            sys_process::exit(1);
+                        }
+                        python::theme::ThemeEngine::register(&name, Path::new(&path));
+                        utils::UserInterface::success(&format!("Theme '{}' registered", name));
+                        sys_process::exit(0);
+                    }
+                    "unregister" => {
+                        let name = args.next().unwrap_or_default();
+                        if name.is_empty() {
+                            utils::UserInterface::error("Usage: ous --theme unregister <name>");
+                            sys_process::exit(1);
+                        }
+                        python::theme::ThemeEngine::unregister(&name);
+                        utils::UserInterface::success(&format!("Theme '{}' unregistered", name));
+                        sys_process::exit(0);
+                    }
+                    "apply" => {
+                        let name = args.next().unwrap_or_default();
+                        if name.is_empty() {
+                            utils::UserInterface::error("Usage: ous --theme apply <name>");
+                            sys_process::exit(1);
+                        }
+                        match python::theme::ThemeEngine::by_name(&name) {
+                            Some(entry) => match python::theme::ThemeEngine::apply(&entry) {
+                                Ok(out) => { println!("{}", out); }
+                                Err(e) => { utils::UserInterface::error(&e); sys_process::exit(1); }
+                            },
+                            None => { utils::UserInterface::error(&format!("Theme '{}' not found", name)); sys_process::exit(1); }
+                        }
+                        sys_process::exit(0);
+                    }
+                    _ => {
+                        utils::UserInterface::error("Usage: ous --theme <list|register|unregister|apply> [args]");
+                        sys_process::exit(1);
+                    }
+                }
+            }
+            "--tui" => {
+                let sub = args.next().unwrap_or_default();
+                match sub.as_str() {
+                    "list" => {
+                        let tuis = python::tui::TuiEngine::list();
+                        if tuis.is_empty() {
+                            utils::UserInterface::info("No TUI apps registered.");
+                        } else {
+                            for t in &tuis {
+                                utils::UserInterface::info(&format!("  {} ({})", t.name, t.path));
+                            }
+                        }
+                        sys_process::exit(0);
+                    }
+                    "register" => {
+                        let name = args.next().unwrap_or_default();
+                        let path = args.next().unwrap_or_default();
+                        if name.is_empty() || path.is_empty() {
+                            utils::UserInterface::error("Usage: ous --tui register <name> <path>");
+                            sys_process::exit(1);
+                        }
+                        python::tui::TuiEngine::register(&name, Path::new(&path));
+                        utils::UserInterface::success(&format!("TUI '{}' registered", name));
+                        sys_process::exit(0);
+                    }
+                    "unregister" => {
+                        let name = args.next().unwrap_or_default();
+                        if name.is_empty() {
+                            utils::UserInterface::error("Usage: ous --tui unregister <name>");
+                            sys_process::exit(1);
+                        }
+                        python::tui::TuiEngine::unregister(&name);
+                        utils::UserInterface::success(&format!("TUI '{}' unregistered", name));
+                        sys_process::exit(0);
+                    }
+                    "run" => {
+                        let name = args.next().unwrap_or_default();
+                        if name.is_empty() {
+                            utils::UserInterface::error("Usage: ous --tui run <name>");
+                            sys_process::exit(1);
+                        }
+                        match python::tui::TuiEngine::by_name(&name) {
+                            Some(entry) => match python::tui::TuiEngine::apply(&entry) {
+                                Ok(out) => { println!("{}", out); }
+                                Err(e) => { utils::UserInterface::error(&e); sys_process::exit(1); }
+                            },
+                            None => { utils::UserInterface::error(&format!("TUI '{}' not found", name)); sys_process::exit(1); }
+                        }
+                        sys_process::exit(0);
+                    }
+                    _ => {
+                        utils::UserInterface::error("Usage: ous --tui <list|register|unregister|run> [args]");
                         sys_process::exit(1);
                     }
                 }
@@ -129,14 +259,24 @@ fn main() -> Result<()> {
                 let staging_dir = args.next().into_iter().next().unwrap_or_default();
                 let output_package = args.next().into_iter().next().unwrap_or_default();
                 if staging_dir.is_empty() || output_package.is_empty() {
-                    UserInterface::error(&format!("Usage: ous -a <staging_dir> <output_package.xcs>"));
+                    UserInterface::error("Usage: ous -a <staging_dir> <output_package.xcs>");
                     sys_process::exit(1);
                 }
                 let level = env::var("OUS_ZSTD_LEVEL").unwrap_or_else(|_| "3".to_string());
-                let status = sys_process::Command::new("sh")
-                    .args(["-c", &format!("tar -c -C {} . | zstd -{} > {}", staging_dir, level, output_package)])
-                    .status()?;
-                if !status.success() { UserInterface::error(&format!("Manual archive compression failed")); }
+                let mut tar_cmd = sys_process::Command::new("tar");
+                tar_cmd.args(["-c", "-C", &staging_dir, "."]);
+                let mut tar_child = tar_cmd.stdout(sys_process::Stdio::piped()).spawn()?;
+                let mut zstd_child = sys_process::Command::new("zstd")
+                    .arg(format!("-{}", level))
+                    .stdin(sys_process::Stdio::from(tar_child.stdout.take().expect("tar stdout")))
+                    .stdout(sys_process::Stdio::from(fs::File::create(&output_package)?))
+                    .spawn()?;
+                let tar_status = tar_child.wait()?;
+                let zstd_status = zstd_child.wait()?;
+                if !tar_status.success() || !zstd_status.success() {
+                    UserInterface::error("Manual archive compression failed");
+                    sys_process::exit(1);
+                }
                 UserInterface::info(&format!("Successfully archived {} to {}", staging_dir, output_package));
                 sys_process::exit(0);
             }
@@ -144,7 +284,7 @@ fn main() -> Result<()> {
                 let input_package = args.next().into_iter().next().unwrap_or_default();
                 let root = args.next().into_iter().next().unwrap_or_default();
                 if input_package.is_empty() || root.is_empty() {
-                    UserInterface::error(&format!("Usage: ous -x <package.xcs|directory> <root>"));
+                    UserInterface::error("Usage: ous -x <package.xcs|directory> <root>");
                     sys_process::exit(1);
                 }
                 fs::create_dir_all(&root)?;
@@ -154,7 +294,7 @@ fn main() -> Result<()> {
                     if let Ok(entries) = fs::read_dir(path_obj) {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.is_file() && p.extension().map_or(false, |ext| ext == "xcs") {
+                            if p.is_file() && p.extension().is_some_and(|ext| ext == "xcs") {
                                 packages.push(p);
                             }
                         }
@@ -163,10 +303,14 @@ fn main() -> Result<()> {
                     packages.push(path_obj.to_path_buf());
                 }
                 for f in packages {
-                    println!("Unpacking package: {}", f.file_name().unwrap().to_string_lossy());
-                    let _ = sys_process::Command::new("sh")
-                        .args(["-c", &format!("tar --zstd -xf '{0}' -C '{1}' 2>/dev/null || zstd -dc '{0}' | tar -xf - -C '{1}' 2>/dev/null || true", f.to_string_lossy(), root)])
-                        .status();
+                    println!("Unpacking package: {}", f.file_name().expect("path has file name").to_string_lossy());
+                    let status = sys_process::Command::new("sh")
+                        .args(["-c", &format!("tar --zstd -xf {0} -C {1} 2>/dev/null || zstd -dc {0} | tar -xf - -C {1} 2>/dev/null", sh_quote(&f.to_string_lossy()), sh_quote(&root))])
+                        .status()?;
+                    if !status.success() {
+                        UserInterface::error(&format!("Failed to extract package: {}", f.display()));
+                        sys_process::exit(1);
+                    }
                 }
                 sys_process::exit(0);
             }
@@ -179,7 +323,7 @@ fn main() -> Result<()> {
                 let src_dir = args.next().into_iter().next().unwrap_or_default();
                 let dest_dir = args.next().into_iter().next().unwrap_or_default();
                 if src_dir.is_empty() || dest_dir.is_empty() {
-                    UserInterface::error(&format!("Usage: ous -w <src_dir> <dest_dir>"));
+                    UserInterface::error("Usage: ous -w <src_dir> <dest_dir>");
                     sys_process::exit(1);
                 }
                 let mut pkg_name = "custom-package".to_string();
@@ -210,7 +354,10 @@ fn main() -> Result<()> {
                         source: "manual".into(),
                         license: "Unknown".into(),
                         arch: "unknown".into(),
-                        checksum: sum[0].clone(),
+                        checksum: sum.first().cloned().unwrap_or(ous::Checksum {
+                            kind: "sha256".into(),
+                            value: String::new(),
+                        }),
                         dependencies: Vec::new(),
                         files: Vec::new(),
                         provides: None,
@@ -228,8 +375,8 @@ fn main() -> Result<()> {
             "-i" | "--inspect" => {
                 let input_package = args.next().into_iter().next().unwrap_or_default();
                 if input_package.is_empty() {
-                    UserInterface::error(&format!("Usage: os -i <path/to/package.xcs>"));
-
+                    UserInterface::error("Usage: os -i <path/to/package.xcs>");
+                    sys_process::exit(1);
                 }
                 
                 let path_obj = Path::new(&input_package);
@@ -267,14 +414,10 @@ fn main() -> Result<()> {
                     let mut archive = tar::Archive::new(decoder);
                     if let Ok(entries) = archive.entries() {
                         for entry in entries.flatten() {
-                            if let Ok(path) = entry.path() {
-                                if path.file_name().map_or(false, |n| n == "metadata.json") {
-                                    if let Ok(meta_struct) = serde_json::from_reader::<_, ous::PackageMetadata>(entry) {
-                                        embedded = vec![meta_struct.checksum];
-                                        break;
-                                    }
+                            if let Ok(path) = entry.path() && path.file_name().is_some_and(|n| n == "metadata.json") && let Ok(meta_struct) = serde_json::from_reader::<_, ous::PackageMetadata>(entry) {
+                                    embedded = vec![meta_struct.checksum];
+                                    break;
                                 }
-                            }
                         }
                     }
                 }
@@ -284,7 +427,7 @@ fn main() -> Result<()> {
                     .unwrap_or_default();
 
                 if embedded.is_empty() {
-                    UserInterface::warning(&format!("Status           : \x1b[33m[WARNING]\x1b[0m Embedded metadata.json not found inside archive."));
+                    UserInterface::warning("Status           : \x1b[33m[WARNING]\x1b[0m Embedded metadata.json not found inside archive.");
                     for cs in &current_checksums {
                         println!("  {}: {}", cs.kind, cs.value);
                     }
@@ -506,6 +649,15 @@ fn main() -> Result<()> {
         use std::sync::mpsc;
         use std::thread;
 
+        struct ActiveGuard {
+            active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -521,11 +673,13 @@ fn main() -> Result<()> {
             let quiet = env::var("OUS_QUIET").is_ok();
             active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             handles.push(thread::spawn(move || {
-                let result = match process(&pkg, &out) {
+                let _guard = ActiveGuard { active: std::sync::Arc::clone(&active) };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(&pkg, &out)))
+                    .unwrap_or_else(|_| Err(anyhow!("worker panicked")));
+                let result = match result {
                     Ok(p) => { if !quiet { format!("OK: {}", p) } else { String::new() } }
                     Err(e) => { format!("Abort: {}", e) }
                 };
-                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 let _ = tx.send(result);
             }));
         }

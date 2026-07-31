@@ -1,17 +1,20 @@
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json;
-#[allow(unused_imports)]
 use md5::{Digest as _, Md5};
-#[allow(unused_imports)]
-use sha1::{Digest as _, Sha1};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{collections::{HashMap, HashSet}, env, fs, io::Read, path::Path, path::PathBuf, process::Command};
 
+pub mod config;
 pub mod utils;
-pub mod plugin;
+pub mod python;
+pub mod event;
 use crate::utils::ui::UserInterface;
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Symlink {
@@ -158,8 +161,15 @@ pub fn fetch(src: &str, dir: &str) -> Result<()> {
                 let entry = entry?;
                 let path = entry.path();
                 let dest = dst.join(entry.file_name());
-                if path.is_dir() {
+                let md = fs::symlink_metadata(&path)?;
+                if md.is_dir() {
                     copy_dir_recursive(&path, &dest)?;
+                } else if md.file_type().is_symlink() {
+                    let target = fs::read_link(&path)?;
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    std::os::unix::fs::symlink(target, &dest)?;
                 } else {
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
@@ -253,8 +263,12 @@ pub fn build(pkg: &Package, dir: &str) -> Result<String> {
             let target = env::var("OUS_TARGET").unwrap_or_else(|_| "x86_64-unknown-linux-musl".to_string());
             let cpu = if target.contains("aarch64") { "armv8-a" } else { "x86-64-v3" };
             UserInterface::info(&format!("Running automatic cargo build for {target}..."));
+            let flags = format!(
+                "-C linker=clang -C target-cpu={cpu} -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+crt-static -C link-arg=-target -C link-arg={target} -C link-arg=-march={cpu} -C link-arg=-O3 -C link-arg=-flto=full -C link-arg=--sysroot=/system"
+            );
             let cmd = format!(
-                "RUSTFLAGS=\"-C linker=clang -C target-cpu={cpu} -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+crt-static -C link-arg=-target -C link-arg={target} -C link-arg=-march={cpu} -C link-arg=-O3 -C link-arg=-flto=full -C link-arg=--sysroot=/system\" cargo build --release --target {target} 2>&1 | tee capture.log"
+                "RUSTFLAGS={} cargo build --release --target {} 2>&1 | tee capture.log",
+                sh_quote(&flags), sh_quote(&target)
             );
             let out = Command::new("sh")
                 .args(["-c", &cmd])
@@ -305,7 +319,7 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
         UserInterface::warning("Skipping install step as requested");
         if let Some(links) = &pkg.links {
             for l in links {
-                symlink(&l.0, &l.1, dest)?;
+                symlink(l.0, l.1, dest)?;
             }
         }
         return Ok(());
@@ -315,7 +329,7 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
         if std::env::var("OUS_NO_AUTO").is_ok() {
             if let Some(links) = &pkg.links {
                 for l in links {
-                    symlink(&l.0, &l.1, dest)?;
+                    symlink(l.0, l.1, dest)?;
                 }
             }
             return Ok(());
@@ -329,24 +343,30 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
                 if let Ok(entries) = fs::read_dir(&target_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.is_file() {
-                            if let Some(fname) = path.file_name() {
+                        if path.is_file()
+                            && let Some(fname) = path.file_name() {
                                 let dest_file = Path::new(dest).join(fname);
                                 let _ = fs::remove_file(&dest_file);
                                 fs::copy(&path, &dest_file)?;
                             }
-                        }
                     }
                 }
             }
 
             if let Some(links) = &pkg.links {
                 for l in links {
-                    symlink(&l.0, &l.1, dest)?;
+                    symlink(l.0, l.1, dest)?;
                 }
             }
             return Ok(());
         }
+
+        if let Some(links) = &pkg.links {
+            for l in links {
+                symlink(l.0, l.1, dest)?;
+            }
+        }
+        return Ok(());
     }
 
     UserInterface::info("Executing custom install command...");
@@ -360,7 +380,7 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
 
     if let Some(links) = &pkg.links {
         for l in links {
-            symlink(&l.0, &l.1, dest)?;
+            symlink(l.0, l.1, dest)?;
         }
     }
     Ok(())
@@ -368,6 +388,13 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
 
 pub fn hash(dir: &str) -> Result<Vec<Checksum>> {
     let output = Command::new("tar").args(["-cf", "-", "-C", dir, "."]).output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "tar failed while hashing directory '{}': {}",
+            dir,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
 
     let sha256 = Sha256::digest(&output.stdout);
     let sha1 = Sha1::digest(&output.stdout);
@@ -398,10 +425,8 @@ fn files(dir: &str) -> Result<Vec<String>> {
                 let path = entry.path();
                 if path.is_dir() {
                     paths.push(path);
-                } else {
-                    if let Ok(rel) = path.strip_prefix(dir) {
-                        files.push(rel.to_string_lossy().to_string());
-                    }
+                } else if let Ok(rel) = path.strip_prefix(dir) {
+                    files.push(rel.to_string_lossy().to_string());
                 }
             }
         }
@@ -419,11 +444,10 @@ fn provides(dir: &str) -> Result<Vec<String>> {
                 let path = entry.path();
                 if path.is_dir() {
                     paths.push(path);
-                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".so") || name.contains(".so.") {
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && (name.ends_with(".so") || name.contains(".so.")) {
                         provides.push(name.to_string());
                     }
-                }
             }
         }
     }
@@ -435,22 +459,28 @@ fn provides(dir: &str) -> Result<Vec<String>> {
 fn license(src_dir: &str) -> String {
     let license_files = ["LICENSE", "COPYING", "LICENSE.MD", "COPYING.MD", "MIT-LICENSE", "UNLICENSE"];
     let license_regex = Regex::new(
-        r"(?i)(gnu\s+general\s+public\s+license|gpl|lgpl|agpl|apache|mit|bsd|mpl|mozilla\s+public\s+license|unlicense|isc)\s*(v(?:ersion)?\s*\d+(?:\.\d+)?|\d+[-—]clause|\d+(?:\.\d+)?\b)?"
-    ).unwrap();
+        r"(?i)\b(gnu\s+general\s+public\s+license|gpl|lgpl|agpl|apache|mit|bsd|mpl|mozilla\s+public\s+license|unlicense|isc)\b\s*(v(?:ersion)?\s*\d+(?:\.\d+)?|\d+[-—]clause|\d+(?:\.\d+)?\b)?"
+    ).expect("valid license regex");
 
     if let Ok(entries) = fs::read_dir(src_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_uppercase();
             
-            if license_files.iter().any(|&f| name.contains(f)) {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
+            if license_files.iter().any(|&f| name.contains(f))
+                && let Ok(content) = fs::read_to_string(entry.path()) {
                     for cap in license_regex.captures_iter(&content) {
                         let license_name = cap.get(1).map_or("", |m| m.as_str().trim());
                         let mut formatted_name = if license_name.len() <= 4 {
                             license_name.to_uppercase()
                         } else {
                             license_name.split_whitespace()
-                                .map(|w| format!("{}{}", &w[..1].to_uppercase(), &w[1..]))
+                                .map(|w| {
+                                    let mut chars = w.chars();
+                                    match chars.next() {
+                                        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                                        None => String::new(),
+                                    }
+                                })
                                 .collect::<Vec<String>>()
                                 .join(" ")
                         };
@@ -477,7 +507,6 @@ fn license(src_dir: &str) -> String {
                         }
                     }
                 }
-            }
         }
     }
     "Unknown".into()
@@ -495,7 +524,7 @@ pub fn scan(dest_dir: &str, log_content: &str, current_pkg: &Package, repo_root:
     }
 
     let library_names = libdep(dest_dir)?;
-    let library_packages = mltp(repo_root)?;
+    let library_packages = mltp(repo_root, &current_pkg.arch)?;
 
     for lib in library_names {
         let normalized = normalize(&lib);
@@ -567,27 +596,30 @@ pub fn scan(dest_dir: &str, log_content: &str, current_pkg: &Package, repo_root:
 fn cdd(log_content: &str) -> Vec<(String, String)> {
     let mut results = Vec::new();
 
+    let re = Regex::new(r"(?i)pkg-config[^\n]*--libs\s+([^\s]+)").expect("valid regex");
+    let dep_colon_re = Regex::new(r"(?i)(?:dependency|package)\b[^:\n]*:\s*([^\s]+)").expect("valid regex");
     for line in log_content.lines() {
         let lower = line.to_lowercase();
         let mut extracted_name = String::new();
 
         if lower.contains("pkg-config") {
-            if let Some(caps) = Regex::new(r"(?i)pkg-config[^\n]*--libs\s+([^\s]+)")
-                .unwrap()
-                .captures(line)
+            if let Some(caps) = re.captures(line)
             {
                 extracted_name = caps[1].to_string();
             }
         } else if (lower.contains("dependency") || lower.contains("package")) && lower.contains("found") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(idx) = parts.iter().position(|&r| r.eq_ignore_ascii_case("dependency")) {
-                if idx + 1 < parts.len() {
-                    extracted_name = parts[idx + 1].to_string();
-                }
-            } else if let Some(idx) = parts.iter().position(|&r| r.eq_ignore_ascii_case("package")) {
-                if idx + 1 < parts.len() {
-                    extracted_name = parts[idx + 1].to_string();
-                }
+            if let Some(caps) = dep_colon_re.captures(line) {
+                extracted_name = caps[1].to_string();
+            } else {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(idx) = parts.iter().position(|&r| r.eq_ignore_ascii_case("dependency")) {
+                    if idx + 1 < parts.len() {
+                        extracted_name = parts[idx + 1].to_string();
+                    }
+                } else if let Some(idx) = parts.iter().position(|&r| r.eq_ignore_ascii_case("package"))
+                    && idx + 1 < parts.len() {
+                        extracted_name = parts[idx + 1].to_string();
+                    }
             }
         } else if lower.starts_with("found ") || lower.starts_with("checking for ") {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -601,7 +633,7 @@ fn cdd(log_content: &str) -> Vec<(String, String)> {
             .trim()
             .to_string();
 
-        let ignore_list = ["threads", "for", "pkg-config", "cmake", "ninja", "yes", "no", "module", "function", "program", "library"];
+        let ignore_list = ["threads", "for", "pkg-config", "cmake", "ninja", "yes", "no", "found", "not", "module", "function", "program", "library"];
         if !clean_name.is_empty() && !ignore_list.contains(&clean_name.to_lowercase().as_str()) {
             results.push((clean_name, "Build".to_string()));
         }
@@ -624,29 +656,25 @@ fn libdep(dest_dir: &str) -> Result<HashSet<String>> {
                     continue;
                 }
 
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".so") || name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".a") {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && (name.ends_with(".so") || name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".a")) {
                         libs.insert(name.to_string());
                     }
-                }
 
                 if let Ok(mut f) = fs::File::open(&path) {
                     let mut buf = [0; 4];
-                    if f.read_exact(&mut buf).is_ok() && &buf == b"\x7fELF" {
-                        if let Ok(out) = Command::new("readelf").arg("-d").arg(&path).output() {
+                    if f.read_exact(&mut buf).is_ok() && &buf == b"\x7fELF"
+                        && let Ok(out) = Command::new("readelf").arg("-d").arg(&path).output() {
                             let stdout = String::from_utf8_lossy(&out.stdout);
                             for line in stdout.lines() {
-                                if line.contains("(NEEDED)") {
-                                    if let Some(start) = line.find('[') {
-                                        if let Some(end) = line.find(']') {
+                                if line.contains("(NEEDED)")
+                                    && let Some(start) = line.find('[')
+                                        && let Some(end) = line.find(']') {
                                             let lib = line[start + 1..end].to_string();
                                             libs.insert(lib);
                                         }
-                                    }
-                                }
                             }
                         }
-                    }
                 }
             }
         }
@@ -676,7 +704,7 @@ fn normalize(lib: &str) -> Vec<String> {
     normalized
 }
 
-fn mltp(repo_root: &Path) -> Result<HashMap<String, Vec<String>>> {
+fn mltp(repo_root: &Path, arch: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut library_packages: HashMap<String, Vec<String>> = HashMap::new();
     let ous_root = repo_root.join(".os");
 
@@ -692,12 +720,14 @@ fn mltp(repo_root: &Path) -> Result<HashMap<String, Vec<String>>> {
             }
 
             let package_name = entry.file_name().to_string_lossy().to_string();
-            let pkg_root = path.join("pkg");
-            if !pkg_root.exists() {
-                continue;
+            let mut pkg_paths = Vec::new();
+            if path.join("pkg").exists() {
+                pkg_paths.push(path.join("pkg"));
+            }
+            if !arch.is_empty() && arch != "native" && path.join(arch).join("pkg").exists() {
+                pkg_paths.push(path.join(arch).join("pkg"));
             }
 
-            let mut pkg_paths = vec![pkg_root];
             while let Some(current_dir) = pkg_paths.pop() {
                 if let Ok(entries) = fs::read_dir(&current_dir) {
                     for entry in entries.flatten() {
@@ -707,8 +737,8 @@ fn mltp(repo_root: &Path) -> Result<HashMap<String, Vec<String>>> {
                             continue;
                         }
 
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.contains(".so") || name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".a") {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                            && (name.contains(".so") || name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".a")) {
                                 for variant in normalize(name) {
                                     let pkg_list = library_packages.entry(variant).or_default();
                                     if !pkg_list.contains(&package_name) {
@@ -716,7 +746,6 @@ fn mltp(repo_root: &Path) -> Result<HashMap<String, Vec<String>>> {
                                     }
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -740,7 +769,8 @@ fn loadex(repo_root: &Path, arch: &str) -> Result<HashMap<String, HashSet<String
     }
 
     let index_content = fs::read_to_string(&index_path)?;
-    let packages: Vec<PackageMetadata> = serde_json::from_str(&index_content).unwrap_or_default();
+    let packages: Vec<PackageMetadata> = serde_json::from_str(&index_content)
+        .map_err(|e| anyhow!("Failed to parse index {}: {}", index_path.display(), e))?;
 
     for pkg in packages {
         let dep_names = pkg
@@ -788,10 +818,13 @@ pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_conte
 
     let target_type = env::var("OUS_HASH_TYPE").unwrap_or_else(|_| "sha256".to_string());
     
-    let selected = sum.iter()
-        .find(|c| c.kind == target_type)
-        .cloned()
-        .unwrap_or_else(|| sum[0].clone());
+    let selected = if let Some(c) = sum.iter().find(|c| c.kind == target_type) {
+        c.clone()
+    } else if let Some(first) = sum.first() {
+        first.clone()
+    } else {
+        return Err(anyhow!("No checksum values available for {}", pkg.name));
+    };
 
     let components = assign_components(&pkg_files, pkg);
 
@@ -837,7 +870,7 @@ pub fn assign_components(pkg_files: &[String], pkg: &Package) -> Vec<Component> 
             return vec![Component {
                 name: "core".to_string(),
                 priority: "required".to_string(),
-                files: pkg_files.iter().map(|f| PathBuf::from(f)).collect(),
+                files: pkg_files.iter().map(PathBuf::from).collect(),
                 dependencies: Vec::new(),
                 description: format!("Core files for {}", pkg.name),
             }];
@@ -851,7 +884,10 @@ pub fn assign_components(pkg_files: &[String], pkg: &Package) -> Vec<Component> 
         let mut matched = Vec::new();
         for pattern in &spec.files {
             for file in pkg_files {
-                if file == pattern || file.starts_with(pattern) {
+                let boundary_match = file.starts_with(pattern)
+                    && file.is_char_boundary(pattern.len())
+                    && file[pattern.len()..].chars().next().is_none_or(|c| c == '/');
+                if file == pattern || boundary_match {
                     matched.push(PathBuf::from(file));
                     unassigned_files.remove(file);
                 }
@@ -864,7 +900,7 @@ pub fn assign_components(pkg_files: &[String], pkg: &Package) -> Vec<Component> 
 
     if !unassigned_files.is_empty() {
         let core_files: Vec<PathBuf> = unassigned_files.into_iter().map(PathBuf::from).collect();
-        let entry = assigned.entry("core".to_string()).or_insert_with(Vec::new);
+        let entry = assigned.entry("core".to_string()).or_default();
         entry.extend(core_files);
         entry.sort();
         entry.dedup();
@@ -887,12 +923,23 @@ pub fn assign_components(pkg_files: &[String], pkg: &Package) -> Vec<Component> 
         }
     }).collect();
 
+    if let Some(core_files) = assigned.get("core")
+        && !core_files.is_empty()
+        && !specs.iter().any(|s| s.name == "core") {
+            components.push(Component {
+                name: "core".to_string(),
+                priority: "required".to_string(),
+                files: core_files.clone(),
+                dependencies: Vec::new(),
+                description: format!("Core files for {}", pkg.name),
+            });
+        }
+
     let has_required = components.iter().any(|c| c.priority == "required");
-    if !has_required && !components.is_empty() {
-        if let Some(first) = components.first_mut() {
+    if !has_required && !components.is_empty()
+        && let Some(first) = components.first_mut() {
             first.priority = "required".to_string();
         }
-    }
 
     components.sort_by(|a, b| a.name.cmp(&b.name));
     components
@@ -905,6 +952,7 @@ pub fn meta(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_cont
 }
 
 pub fn write(meta: &PackageMetadata, dest: &str) -> Result<()> {
+    fs::create_dir_all(dest)?;
     let path = format!("{}/metadata.json", dest);
     let json = serde_json::to_string_pretty(meta)?;
     fs::write(path, json)?;
@@ -922,7 +970,8 @@ pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
 
     let mut entries: Vec<PackageMetadata> = if index_path.exists() {
         let existing = fs::read_to_string(&index_path)?;
-        serde_json::from_str(&existing).unwrap_or_default()
+        serde_json::from_str(&existing)
+            .map_err(|e| anyhow!("Failed to parse index {}: {}", index_path.display(), e))?
     } else {
         Vec::new()
     };
@@ -945,8 +994,21 @@ pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
 
 pub fn archive(dest: &str, out: &str) -> Result<()> {
     let level = env::var("OUS_ZSTD_LEVEL").unwrap_or_else(|_| "3".to_string());
-    let status = Command::new("sh").args(["-c", &format!("tar -c -C {} . | zstd -{} > {}", dest, level, out)]).status()?;
-    if status.success() { Ok(()) } else { Err(anyhow!("Archive compression failed")) }
+    let mut tar_cmd = Command::new("tar");
+    tar_cmd.args(["-c", "-C", dest, "."]);
+    let mut tar_child = tar_cmd.stdout(std::process::Stdio::piped()).spawn()?;
+    let mut zstd_child = Command::new("zstd")
+        .arg(format!("-{}", level))
+        .stdin(std::process::Stdio::from(tar_child.stdout.take().expect("tar stdout")))
+        .stdout(std::process::Stdio::from(fs::File::create(out)?))
+        .spawn()?;
+    let tar_status = tar_child.wait()?;
+    let zstd_status = zstd_child.wait()?;
+    if tar_status.success() && zstd_status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("Archive compression failed"))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -960,27 +1022,26 @@ fn save_state(path: &Path, state: &BuildProgress) -> Result<()> {
     Ok(())
 }
 
-pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
-    use crate::plugin::{PluginManager, PluginHook, PluginEvent};
+fn validate_path_component(value: &str, label: &str) -> Result<()> {
+    let safe = value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if value.is_empty()
+        || value.contains('/')
+        || value.contains("..")
+        || value.starts_with('.')
+        || !safe {
+        return Err(anyhow!(
+            "Invalid {} '{}': only letters, digits, '-', '_' and '.' are allowed; '/', '..' and a leading '.' are forbidden",
+            label, value
+        ));
+    }
+    Ok(())
+}
 
+pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
+    validate_path_component(&pkg.name, "package name")?;
+    validate_path_component(&pkg.arch, "package arch")?;
     UserInterface::info(&format!("Processing package: {} v{}", pkg.name, pkg.version));
     let current_dir = env::current_dir()?;
-
-    let plugin_mgr = PluginManager::new(&current_dir);
-
-    let make_event = |hook: &str| -> PluginEvent {
-        PluginEvent {
-            hook: hook.to_string(),
-            package: Some(pkg.name.clone()),
-            version: Some(pkg.version.clone()),
-            source: Some(pkg.source.clone()),
-            build_type: Some(pkg.build_type.clone()),
-            work_dir: None,
-            root_dir: None,
-            output_path: None,
-            arch: Some(pkg.arch.clone()),
-        }
-    };
 
     let absolute_out_dir = current_dir.join(out_dir);
     fs::create_dir_all(&absolute_out_dir)?;
@@ -1000,7 +1061,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     let src_dir = work_dir.join("src");
     let pkg_root = work_dir.join("pkg");
     let state_path = work_dir.join(".state.json");
-    let build_log_path = work_dir.join("build_log.txt");
+    let build_log_path = work_dir.join("ous.log");
     let sum_path = work_dir.join("checksums.json");
 
     let mut state = BuildProgress::default();
@@ -1018,17 +1079,15 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         fs::create_dir_all(&pkg_root)?;
     }
 
-    let src_str = src_dir.to_str().unwrap();
-    let root_str = pkg_root.to_str().unwrap();
+    let src_str = src_dir.to_str().expect("valid UTF-8 path");
+    let root_str = pkg_root.to_str().expect("valid UTF-8 path");
 
     if !state.completed_steps.contains("fetch") {
         UserInterface::info("Fetching package source...");
-        plugin_mgr.fire_hook(PluginHook::PreFetch, &make_event("pre-fetch"));
         fetch(&pkg.source, src_str).map_err(|e| {
             UserInterface::error(&format!("Fetch step failed: {}", e));
             anyhow!(e).context("Fetch step failed")
         })?;
-        plugin_mgr.fire_hook(PluginHook::PostFetch, &make_event("post-fetch"));
         state.completed_steps.insert("fetch".to_string());
         save_state(&state_path, &state)?;
     }
@@ -1037,12 +1096,10 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         fs::read_to_string(&build_log_path).unwrap_or_default()
     } else {
         UserInterface::info("Building package modules...");
-        plugin_mgr.fire_hook(PluginHook::PreBuild, &make_event("pre-build"));
         let log = build(pkg, src_str).map_err(|e| {
             UserInterface::error(&format!("Build step failed: {}", e));
             anyhow!(e).context("Build step failed")
         })?;
-        plugin_mgr.fire_hook(PluginHook::PostBuild, &make_event("post-build"));
         fs::write(&build_log_path, &log)?;
         state.completed_steps.insert("build".to_string());
         save_state(&state_path, &state)?;
@@ -1051,12 +1108,10 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
 
     if !state.completed_steps.contains("install") {
         UserInterface::info("Installing built files to root target...");
-        plugin_mgr.fire_hook(PluginHook::PreInstall, &make_event("pre-install"));
         install(pkg, src_str, root_str).map_err(|e| {
             UserInterface::error(&format!("Install step failed: {}", e));
             anyhow!(e).context("Install step failed")
         })?;
-        plugin_mgr.fire_hook(PluginHook::PostInstall, &make_event("post-install"));
         state.completed_steps.insert("install".to_string());
         save_state(&state_path, &state)?;
     }
@@ -1067,12 +1122,10 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         })
     } else {
         UserInterface::info("Generating build checksum hash...");
-        plugin_mgr.fire_hook(PluginHook::PreHash, &make_event("pre-hash"));
         let s = hash(root_str).map_err(|e| {
             UserInterface::error(&format!("Hashing step failed: {}", e));
             anyhow!(e).context("Hashing step failed")
         })?;
-        plugin_mgr.fire_hook(PluginHook::PostHash, &make_event("post-hash"));
         fs::write(&sum_path, serde_json::to_string(&s)?)?;
         state.completed_steps.insert("hash".to_string());
         save_state(&state_path, &state)?;
@@ -1081,7 +1134,6 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
 
     if !state.completed_steps.contains("metadata") {
         UserInterface::info("Compiling dependency graph and manifest metadata...");
-        plugin_mgr.fire_hook(PluginHook::PreMetadata, &make_event("pre-metadata"));
         let metadata = mtd(pkg, root_str, &sum, src_str, &build_log, current_dir.as_path()).map_err(|e| {
             UserInterface::error(&format!("Metadata generation failed: {}", e));
             anyhow!(e).context("Metadata generation failed")
@@ -1090,23 +1142,20 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
             UserInterface::error(&format!("Writing metadata json failed: {}", e));
             anyhow!(e).context("Metadata generation failed")
         })?;
-        index(current_dir.to_str().unwrap(), &metadata).map_err(|e| {
+        index(current_dir.to_str().expect("valid UTF-8 path"), &metadata).map_err(|e| {
             UserInterface::error(&format!("Repository index append failed: {}", e));
             anyhow!(e).context("Repository index generation failed")
         })?;
-        plugin_mgr.fire_hook(PluginHook::PostMetadata, &make_event("post-metadata"));
         state.completed_steps.insert("metadata".to_string());
         save_state(&state_path, &state)?;
     }
 
     if !state.completed_steps.contains("archive") {
         UserInterface::info("Compressing target root into final .xcs package...");
-        plugin_mgr.fire_hook(PluginHook::PreArchive, &make_event("pre-archive"));
         archive(root_str, &final_path).map_err(|e| {
             UserInterface::error(&format!("Archiving compression failed: {}", e));
             anyhow!(e).context("Archiving step failed")
         })?;
-        plugin_mgr.fire_hook(PluginHook::PostArchive, &make_event("post-archive"));
         state.completed_steps.insert("archive".to_string());
         save_state(&state_path, &state)?;
     }
@@ -1119,7 +1168,7 @@ pub fn sort_packages(dir: &str, arch: &str) -> Result<()> {
     if !pool_dir.exists() {
         return Err(anyhow!("Directory '{}' not found", dir));
     }
-    let pattern = Regex::new(r"^(.*)-(\d.*?)\.xcs$")?;
+    let pattern = Regex::new(r"^(.*)-(\d[^-]*)\.xcs$")?;
     let mut moved = 0;
     for entry in fs::read_dir(pool_dir)? {
         let entry = entry?;
@@ -1139,7 +1188,7 @@ pub fn sort_packages(dir: &str, arch: &str) -> Result<()> {
             moved += 1;
         }
     }
-    UserInterface::success(&format!("Sorted {} packages into pool/{}/{}/", moved, dir, arch));
+    UserInterface::success(&format!("Sorted {} packages into {}/{}/", moved, dir, arch));
     Ok(())
 }
 
@@ -1166,11 +1215,11 @@ pub fn validate(index_path: &str, packages_dir: &str) -> Result<usize> {
                         UserInterface::error(&format!("{}: missing version", entry.pkg_name));
                         problems += 1;
                     }
-                    if seen.contains(&entry.pkg_name) {
-                        UserInterface::error(&format!("{}: duplicate entry", entry.pkg_name));
+                    if seen.contains(&(entry.pkg_name.clone(), entry.version.clone())) {
+                        UserInterface::error(&format!("{} v{}: duplicate entry", entry.pkg_name, entry.version));
                         problems += 1;
                     }
-                    seen.insert(entry.pkg_name.clone());
+                    seen.insert((entry.pkg_name.clone(), entry.version.clone()));
                 }
             }
             Err(e) => {
@@ -1214,12 +1263,11 @@ pub fn validate(index_path: &str, packages_dir: &str) -> Result<usize> {
             let path = entry.path();
             let mut file = fs::File::open(&path)?;
             let mut magic = [0u8; 4];
-            if file.read_exact(&mut magic).is_ok() {
-                if magic != [0x28, 0xB5, 0x2F, 0xFD] {
+            if file.read_exact(&mut magic).is_ok()
+                && magic != [0x28, 0xB5, 0x2F, 0xFD] {
                     UserInterface::warning(&format!("{}: not a valid zstd archive (bad magic)", fname));
                     problems += 1;
                 }
-            }
         }
     }
 
@@ -1240,7 +1288,7 @@ pub fn checksum_index(index_path: &str, pkg_dir: &str, base_url: &str, arch: &st
     let content = fs::read_to_string(index_file)?;
     let mut index: Vec<PackageMetadata> = serde_json::from_str(&content)?;
 
-    let pattern = Regex::new(r"^(.*)-(\d.*?)\.xcs$")?;
+    let pattern = Regex::new(r"^(.*)-(\d[^-]*)\.xcs$")?;
     let mut by_key: HashMap<(String, String), usize> = HashMap::new();
     for (i, entry) in index.iter().enumerate() {
         by_key.insert((entry.pkg_name.clone(), entry.version.clone()), i);
@@ -1313,15 +1361,23 @@ pub fn sign_packages(index_path: &str, packages_dir: &str, key_id: &str) -> Resu
 
     let pkg_dir = Path::new(packages_dir);
     if pkg_dir.exists() {
-        for entry in fs::read_dir(pkg_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "xcs") {
-                let mut sign_args = vec!["--batch", "--yes", "-u", key_id, "--detach-sign"];
-                sign_args.push(path.to_str().unwrap());
-                let status = Command::new("gpg").args(&sign_args).status()?;
-                if status.success() && env::var("OUS_QUIET").is_err() {
-                    UserInterface::info(&format!("Signed: {}", path.file_name().unwrap().to_string_lossy()));
+        let mut stack = vec![pkg_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let md = fs::symlink_metadata(&path)?;
+                if md.is_dir() {
+                    stack.push(path);
+                } else if md.file_type().is_symlink() {
+                    continue;
+                } else if path.extension().is_some_and(|e| e == "xcs") {
+                    let mut sign_args = vec!["--batch", "--yes", "-u", key_id, "--detach-sign"];
+                    sign_args.push(path.to_str().expect("valid UTF-8 path"));
+                    let status = Command::new("gpg").args(&sign_args).status()?;
+                    if status.success() && env::var("OUS_QUIET").is_err() {
+                        UserInterface::info(&format!("Signed: {}", path.file_name().expect("path has file name").to_string_lossy()));
+                    }
                 }
             }
         }

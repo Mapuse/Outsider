@@ -1171,6 +1171,24 @@ path = "~/plugins/plugin2.py"
 1. **Primary**: If `etc/ous/p.desc` exists, Outsider reads it and loads every `[plugin.*]` section. Each section becomes a plugin.
 2. **Fallback**: If `p.desc` does not exist, Outsider scans `var/lib/ous/plugins/` for any `.py` files and loads them automatically.
 
+### Theme and TUI configuration (`t.desc`)
+
+Themes and TUIs are registered through a TOML descriptor file, `t.desc`, loaded from the first existing, parseable file among (in order): `~/.config/ous/t.desc`, `/etc/ous/t.desc`, `./t.desc`, or `<cwd>/t.desc` (files are never merged). Each `[theme.<id>]` section registers one theme and each `[tui.<id>]` section one TUI.
+
+```toml
+[theme.outsider]
+name = "Outsider"
+path = "~/Outsider/themes/outsider.py"
+description = "Default Outsider theme — violet accent, build-aware prompt"
+
+[theme.minimal]
+name = "Minimal"
+path = "~/Outsider/themes/minimal.py"
+description = "Minimal single-line prompt with exit-code indicator"
+```
+
+`name` is the display name, `path` the Python file (absolute or `~`-expanded), and `description` is optional. Registered themes/TUIs are managed with `ous --theme list|register|unregister|apply` and `ous --tui list|register|unregister|run`. Both `apply` and `run` execute the file out-of-process via `python3 <path>`. `ous --theme list` and `ous --tui list` show `name (path) — description` for entries that have a description.
+
 ### Alias system
 
 Aliases are **unlimited per plugin** and have **no naming restrictions**. The key can be any string, and the value is a shell command executed via `sh -c`.

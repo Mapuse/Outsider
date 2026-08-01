@@ -152,7 +152,11 @@ fn main() -> Result<()> {
                             utils::UserInterface::info("No themes registered.");
                         } else {
                             for t in &themes {
-                                utils::UserInterface::info(&format!("  {} ({})", t.name, t.path));
+                                if t.description.is_empty() {
+                                    utils::UserInterface::info(&format!("  {} ({})", t.name, t.path));
+                                } else {
+                                    utils::UserInterface::info(&format!("  {} ({}) — {}", t.name, t.path, t.description));
+                                }
                             }
                         }
                         sys_process::exit(0);
@@ -208,7 +212,11 @@ fn main() -> Result<()> {
                             utils::UserInterface::info("No TUI apps registered.");
                         } else {
                             for t in &tuis {
-                                utils::UserInterface::info(&format!("  {} ({})", t.name, t.path));
+                                if t.description.is_empty() {
+                                    utils::UserInterface::info(&format!("  {} ({})", t.name, t.path));
+                                } else {
+                                    utils::UserInterface::info(&format!("  {} ({}) — {}", t.name, t.path, t.description));
+                                }
                             }
                         }
                         sys_process::exit(0);

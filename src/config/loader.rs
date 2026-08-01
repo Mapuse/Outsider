@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::schema::Config;
+use crate::utils::ui::UserInterface;
 
 const CONFIG_FILE: &str = "ous.toml";
 
@@ -36,7 +37,7 @@ pub fn load() -> Config {
         Ok(content) => match toml::from_str::<Config>(&content) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("ous: error parsing {}: {}", path.display(), e);
+                UserInterface::error(&format!("error parsing {}: {}", path.display(), e));
                 Config::default()
             }
         },

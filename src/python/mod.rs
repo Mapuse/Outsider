@@ -6,6 +6,7 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use pyo3::prelude::*;
 use crate::config::schema::PythonConfig;
+use crate::utils::ui::UserInterface;
 
 static INIT: Once = Once::new();
 static INIT_FAILED: AtomicBool = AtomicBool::new(false);
@@ -31,7 +32,7 @@ impl PythonEngine {
             }
         });
         if INIT_FAILED.load(Ordering::SeqCst) {
-            eprintln!("ous: python engine unavailable, falling back to native");
+            UserInterface::warning("python engine unavailable, falling back to native");
             return Self { theme: None, tui: None, plugins: plugin::PluginManager::new(), tui_mode: false };
         }
         if !cfg.venv_path.is_empty() {
@@ -41,14 +42,14 @@ impl PythonEngine {
             theme::ThemeEngine::load(cfg)
         }))
         .unwrap_or_else(|e| {
-            eprintln!("ous: python theme failed to load: {:?}", e);
+            UserInterface::warning(&format!("python theme failed to load: {:?}", e));
             None
         });
         let tui = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tui::TuiEngine::load(cfg)
         }))
         .unwrap_or_else(|e| {
-            eprintln!("ous: python tui failed to load: {:?}", e);
+            UserInterface::warning(&format!("python tui failed to load: {:?}", e));
             None
         });
         let mut plugins = plugin::PluginManager::new();
@@ -70,7 +71,7 @@ pub fn expand_tilde(path: &str) -> String {
 fn activate_venv(path_str: &str) {
     let venv = std::path::PathBuf::from(expand_tilde(path_str));
     if !venv.exists() {
-        eprintln!("ous: venv not found: {}", venv.display());
+        UserInterface::warning(&format!("venv not found: {}", venv.display()));
         return;
     }
     let _ = Python::with_gil(|py| -> PyResult<()> {
@@ -96,11 +97,11 @@ fn activate_venv(path_str: &str) {
         for p in &candidates {
             if p.exists() {
                 sys_path.call_method1("insert", (0, p.to_str().unwrap_or_default()))?;
-                eprintln!("ous: activated venv: {} (site-packages: {})", venv.display(), p.display());
+                UserInterface::info(&format!("activated venv: {} (site-packages: {})", venv.display(), p.display()));
                 return Ok(());
             }
         }
-        eprintln!("ous: venv site-packages not found in: {}", venv.display());
+        UserInterface::warning(&format!("venv site-packages not found in: {}", venv.display()));
         Ok(())
     });
 }

@@ -22,9 +22,9 @@ impl UserInterface {
     }
 
     pub fn display_progress(current: usize, total: usize, prefix: &str) {
-        let percentage = if total > 0 { (current * 100) / total } else { 0 };
+        let percentage = (current * 100).checked_div(total).unwrap_or(0);
         let bar_width: usize = 18;
-        let filled_blocks = if total > 0 { (current * bar_width) / total } else { 0 };
+        let filled_blocks = (current * bar_width).checked_div(total).unwrap_or(0);
 
         let filled = "█".repeat(filled_blocks);
         let empty = "░".repeat(bar_width - filled_blocks);

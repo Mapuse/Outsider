@@ -12,7 +12,14 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
@@ -20,6 +27,8 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y meson ninja-build
+    - name: Generate cross file for ${{ matrix.arch }}
+      run: ./gen-cross.sh
     - name: configure
       run: meson setup builddir --cross-file cross.txt
     - name: Build

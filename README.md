@@ -32,11 +32,10 @@
 - [**`[Entry]`**](#entry)
 - [**`[Core]`**](#core)
 - [**`[Binary Reader]`**](#binary-reader)
-  - [**`[ELF]`**](#elf-target-iterator)
-  - [**`[Dynamic Symbol Parser]`**](#dynamic-symbol-parser)
-  - [**`[Dependency Matcher]`**](#dependency-matcher)
-  - [**`[Metadata & Signature]`**](#metadata-synchronization--dependency-signature)
-  - [**`[Resolution by ldd]`**](#resolution-by-ldd)
+  - [**`[ELF library scanner]`**](#elf-library-scanner)
+  - [**`[In-process DT_NEEDED parser]`**](#in-process-dt_needed-parser)
+  - [**`[Source manifest scanning]`**](#source-manifest-scanning)
+  - [**`[Resolution pipeline]`**](#resolution-pipeline)
 - [**`[Build / Resume]`**](#build--resume)
 - [**`[Starting]`**](#starting)
 - [**`[Guide]`**](#guide)
@@ -56,12 +55,13 @@
 
 `Outsider` is built around a single principle: **declarative input, deterministic output**. You provide a JSON manifest describing what to build and how, and `Outsider` handles the rest — fetching source code, executing builds in isolation, scanning for runtime dependencies, generating metadata, and producing compressed archives.
 
-The codebase is split into two files:
+The codebase is split into three files:
 
 - [**`src/main.rs`**] — The CLI argument parser and entry point. It parses command-line flags, reads the manifest, and iterates over each package, calling into the library.
 - [**`src/lib.rs`**] — The core engine. Contains all data structures, the fetch/build/install pipeline, metadata generation, dependency injection, license detection, hashing, archiving, component scanning, service detection, sandbox profiling, repository indexing, and the **Binary Reader** dependency scanner.
+- [**`src/deps.rs`**] — The dependency-scanning primitives: an in-process ELF64 `DT_NEEDED` parser (`read_elf_needed`), the directory-tree library scanner (`libdeps`), and the source-manifest dependency extractor (`scan_source_deps`) for `Cargo.toml`, `package.json`, `meson.build`, `CMakeLists.txt`, `configure.ac`, and `.pc` files.
 
-The engine uses [**`anyhow`**] for error handling with context propagation, [**`serde`**] for JSON serialization and deserialization, [**`sha2`**] for cryptographic hashing, [**`chrono`**] for timestamp generation, and [**`regex`**] for license pattern matching. External system tools (`git`, `curl`, `tar`, `ldd`, `file`) are invoked via `std::process::Command` rather than being linked as libraries, keeping the Rust binary lightweight and delegating specialized work to mature system utilities.
+The engine uses [**`anyhow`**] for error handling with context propagation, [**`serde`**] for JSON serialization and deserialization, [**`sha2`**] for cryptographic hashing, [**`chrono`**] for timestamp generation, and [**`regex`**] for license pattern matching. External system tools (`git`, `curl`, `tar`, `file`) are invoked via `std::process::Command` rather than being linked as libraries, keeping the Rust binary lightweight and delegating specialized work to mature system utilities. ELF dependency discovery no longer shells out to `ldd` — it parses the `.dynamic` section in-process (see [Binary Reader]); `readelf` is used only as a fallback when the in-process parser fails.
 
 </details>
 
@@ -262,6 +262,12 @@ pub struct Dependency {
 - [**`name`**]: The name of the depended-on package (or a raw library name if the library could not be mapped to any known package).
 - [**`dep_type`**]: A human-readable description of how the dependency was discovered. Values include:
   - `"Build"` — discovered from build log parsing (e.g., `pkg-config --libs foo`, `checking for foo...`, `dependency foo found`)
+  - `"Build (cargo)"` — discovered from a `Cargo.toml` (`dependencies`, `dev-dependencies`, `build-dependencies`, or `[workspace.dependencies]`)
+  - `"Build (npm)"` — discovered from a `package.json` (`dependencies`, `devDependencies`, `peerDependencies`, or `optionalDependencies`)
+  - `"Build (meson)"` — discovered from `dependency('...')` calls in `meson.build`
+  - `"Build (cmake)"` — discovered from `find_package(...)` calls in `CMakeLists.txt` / `.cmake` files
+  - `"Build (autotools)"` — discovered from `AC_CHECK_LIB` calls in `configure.ac` / `configure`
+  - `"Build (pkg-config)"` — discovered from `Requires:` / `Requires.private:` in `.pc` files or `PKG_CHECK_MODULES` in autotools scripts
   - `"Library (libfoo.so.1)"` — discovered by scanning ELF binaries in the staging directory and resolving the library to a known package
   - `"Library"` — a raw library that could not be mapped to any known package in the workspace
   - `"Transitive"` — discovered via transitive dependency resolution against the repository index
@@ -302,7 +308,7 @@ The `libraries` field is **only present** when there are at least 2 distinct lib
 
 The consolidation happens in the `scan()` function in `src/lib.rs`. During dependency resolution:
 
-1. **Library enumeration**: `libdep()` scans all ELF binaries and `.so` files in the staging directory to build a set of needed library filenames.
+1. **Library enumeration**: `deps::libdeps()` scans all ELF binaries and `.so`/`.dll`/`.dylib`/`.a` files in the staging directory to build a set of needed library filenames.
 2. **Package resolution**: Each library name is normalized (e.g., `libfoo.so.1` → `["libfoo.so.1", "libfoo.so", "foo.so.1"]`) and looked up in the workspace library index (`mltp()`) to find which packages provide a matching library.
 3. **Consolidation**: `pkg_libs` — a `HashMap<String, Vec<String>>` — tracks every library→package mapping. When converting the dependency map to the final `Vec<Dependency>`, any package with 2 or more entries in `pkg_libs` gets its `libraries` field populated with the sorted, deduplicated list of depended-upon libraries.
 
@@ -379,186 +385,66 @@ The library file contains all the data structures and functions that implement t
 
 ## Binary Reader
 
-One of the most powerful features of `Outsider` is its **Binary Reader** — a zero-bloat dependency scanner that replaces the simplistic `ldd`-only approach with a sophisticated, two-phase analysis engine. Rather than including bulky disassembler libraries (like `libbfd`, `capstone`, or `llvm`) that would bloat the engine's binary, `Outsider` reads ELF binary files directly as raw byte streams and extracts meaningful dependency information from them.
+One of the most powerful features of `Outsider` is its **Binary Reader** — a zero-bloat dependency scanner that replaces the simplistic `ldd`-only approach. Rather than including bulky disassembler libraries (like `libbfd`, `capstone`, or `llvm`), `Outsider` reads ELF binaries directly as raw byte sequences and extracts their link-time dependencies **in-process**, with no external binutils required on the normal path. The same pass that walks the staging tree also scans the unpacked *source* tree for build-time dependencies declared in the common manifest formats.
 
-The Binary Reader consists of four essential components, designed to work together like a mobile application's tightly integrated architecture:
+### ELF library scanner
 
-### ELF Target Iterator
+**Source function:** `deps::libdeps(dest_dir: &str) -> Result<HashSet<String>>`
 
-**Source function:** `elf(dir: &str) -> Result<Vec<PathBuf>>`
+The entry point for the Binary Reader. It performs a recursive directory traversal of the package staging area (typically `system/bin` and `system/lib`) and builds a set of needed library names. For every file it encounters:
 
-The ELF Target Iterator is the entry point for the Binary Reader. It performs a recursive directory traversal, typically scanning `system/bin` and `system/lib` directories inside the package staging area.
+- **Shared-library filenames** — any file whose name ends in `.so`, `.dll`, `.dylib`, or `.a` is recorded by its filename.
+- **ELF binaries** — any file whose first 4 bytes match the ELF magic (`\x7f E L F`; `0x7f 0x45 0x4c 0x46`) is parsed by `read_elf_needed()` (below) and every `DT_NEEDED` entry is recorded.
 
 **Key design decisions:**
 
-- **Magic byte validation**: Rather than relying on file extensions (which scripts and non-ELF files can fake), the iterator reads the first 4 bytes of every file it encounters. ELF binaries begin with the magic bytes `\x7f E L F` (`0x7f 0x45 0x4c 0x46`). Only files matching this signature are included in the results.
-- **Script exclusion**: Shell scripts, Python scripts, and other text-based executables begin with `#!` (shebang) and are automatically filtered out by the ELF magic check. This prevents false positives from non-binary files.
-- **Stack-based traversal**: The iterator uses an explicit `Vec<PathBuf>` as a stack for directory traversal rather than recursion, avoiding potential stack overflow on deeply nested directory trees.
-- **Error tolerance**: Directories that cannot be read (permission denied, broken symlinks) are silently skipped. This ensures that a single inaccessible directory does not block the entire dependency scan.
+- **Magic byte validation**: ELF detection relies on the first 4 bytes of the file, not on file extensions — shell scripts, Python scripts, and other shebang (`#!`) text executables are automatically excluded.
+- **Stack-based traversal**: An explicit `Vec<PathBuf>` stack is used instead of recursion, avoiding stack overflow on deeply nested directory trees.
+- **Error tolerance**: Directories that cannot be read (permission denied, broken symlinks) are silently skipped, so a single inaccessible directory cannot block the whole scan.
+- **Deterministic result**: The final library set is sorted and deduplicated before returning.
 
-**Algorithm:**
+### In-process DT_NEEDED parser
 
-```text
-1. If the root directory does not exist, return an empty vector
-2. Push the root directory onto a stack
-3. While the stack is not empty:
-   a. Pop a directory from the stack
-   b. Read all entries in the directory
-   c. For each entry:
-      - If it is a directory, push it onto the stack
-      - If it is a file, open it and read the first 4 bytes
-      - If the bytes match the ELF magic (0x7f, 0x45, 0x4c, 0x46), add the path to the result
-4. Return the collected ELF binary paths
-```
+**Source function:** `deps::read_elf_needed(path: &Path) -> Result<Vec<String>>`
 
-### Dynamic Symbol Parser
+Compile-time shared-library dependencies are captured by this in-process ELF64 parser. It reads the binary's program headers to locate the `PT_DYNAMIC` segment, walks the `.dynamic` entries, and resolves each `DT_NEEDED` offset against the `.dynstr` string table — no `ldd`, `readelf`, or external binutils involved:
 
-**Source function:** `strings(path: &Path) -> Result<Vec<String>>`
+1. Validate the ELF magic bytes (`\x7fELF`) and the `ELFCLASS64` class byte (`e_ident[4] == 2`)
+2. Walk the program-header table, building a virtual-address → file-offset map from the `PT_LOAD` segments and locating the `PT_DYNAMIC` segment (type `2`)
+3. Parse the `.dynamic` entries in place, collecting every `DT_NEEDED` string offset plus the `DT_STRTAB` / `DT_STRSZ` locations
+4. Read each needed library name out of the string table, skipping any shorter than 4 bytes
 
-The Dynamic Symbol Parser is the core innovation of the Binary Reader. It reads an ELF binary as a raw byte stream and extracts printable ASCII strings of length >= 4 characters. This is the "zero-bloat" approach — no disassembler libraries, no heavy parsing infrastructure, just the binary's own byte content.
+Non-ELF, non-`ELFCLASS64`, or statically linked files yield an empty result. Only a file that cannot be read at all produces an error — and in that single case `libdeps()` falls back to shelling out to `readelf -d` for that file alone. The old `ldd` subprocess is gone entirely.
 
-**What this catches:**
+### Source manifest scanning
 
-- **DT_NEEDED entries** from the `.dynstr` section of the ELF dynamic symbol table. These are the compile-time declared library dependencies that `ldd` also shows. The library names (e.g., `libfoo.so`, `libbar.so.1.0.0`) appear as printable strings in the `.dynstr` section.
-- **`dlopen()` runtime calls**: When a binary calls `dlopen("/system/lib/libfoo.so", RTLD_NOW)` or `dlopen("libbar.so", RTLD_LAZY)`, the library path or name string is embedded in the `.rodata` section of the binary. `ldd` does NOT see these because they are not DT_NEEDED entries — they are runtime decisions. The Byte Stream Reader catches them because it scans all printable strings regardless of section.
-- **`dlsym()` patterns**: Similar to `dlopen`, any library name or path string in `dlsym()` arguments is captured.
-- **Embedded path strings**: Strings like `/system/lib/libquux.so` or `/usr/lib/libextra.so` that may be embedded in configuration data or string tables.
+**Source function:** `deps::scan_source_deps(src_dir: &str) -> Vec<(String, String)>`
 
-**Key design considerations:**
+Build-time dependencies are extracted from the unpacked source tree by reading the common manifest formats directly (fast, pure file reads, no subprocesses). The walk skips noise directories: `target`, `.git`, `node_modules`, `vendor`, `build`, `dist`, `.os`, `__pycache__`, `.cargo`, `third_party`, and `deps`.
 
-- **Minimum length filter**: Only strings of length >= 4 characters are captured. This filters out noise from single-byte characters and short garbage sequences that happen to align with printable ASCII.
-- **Printable character set**: The parser collects bytes that are ASCII graphic (alphanumeric and punctuation) plus the characters `/`, `.`, `-`, `_`, and space. These are the characters commonly found in library paths and filenames.
-- **Numeric noise filter**: Purely numeric strings (e.g., version numbers, addresses) are filtered out, as they cannot be library names.
-- **Zero dependency footprint**: The entire string extraction is done with Rust's standard library file I/O plus basic byte iteration. No external parsing libraries are needed.
-- **Streaming chunk-based reading**: To handle very large binaries (hundreds of megabytes or more) without exhausting memory on constrained devices, the function reads the file in 64KB chunks rather than loading the entire file at once. A carryover buffer ensures that strings split across chunk boundaries are correctly reassembled.
+| Manifest file | Matches | `dep_type` emitted |
+| --- | --- | --- |
+| `Cargo.toml` | `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]` | `Build (cargo)` |
+| `package.json` | `dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies` | `Build (npm)` |
+| `meson.build` | `dependency('...')` calls | `Build (meson)` |
+| `CMakeLists.txt` / `*.cmake` | `find_package(...)` calls | `Build (cmake)` |
+| `configure.ac` / `configure` | `PKG_CHECK_MODULES`, `AC_CHECK_LIB` | `Build (pkg-config)` / `Build (autotools)` |
+| `*.pc` | `Requires:` / `Requires.private:` lines | `Build (pkg-config)` |
 
-**Algorithm:**
+Dependencies matching the package being built (case-insensitively) are skipped.
 
-```text
-1. Open the binary file for reading
-2. Initialize a carryover buffer (empty)
-3. While not at EOF:
-   a. Read 64KB chunk from file
-   b. Combine carryover + current chunk
-   c. Iterate over each byte in combined buffer:
-      - If printable ASCII (graphic, /, ., -, _, or space):
-        * Append to current string buffer
-      - Otherwise (non-printable byte):
-        * If current buffer length >= 4:
-          - Convert to UTF-8 string
-          - Skip if purely numeric
-          - Add to results
-        * Clear current buffer
-   d. Save incomplete string (if any) to carryover for next iteration
-4. Process any remaining carryover at EOF (same logic as above)
-5. Return all extracted strings
-```
+### Resolution pipeline
 
-### Dependency Matcher
+The full dependency analysis is orchestrated by `scan(dest_dir, src_dir, log_content, current_pkg, repo_root)` in `lib.rs`:
 
-**Source function:** `bds(dirs: &[[&str]]) -> Result<Vec<String>>`
+1. **Source manifests** (`scan_source_deps()`) — build-time deps from the formats above
+2. **Build-log parsing** (`cdd()`) — package names from configure/meson/cmake output
+3. **Library scanning** (`libdeps()`) — runtime `.so`/`.dll`/`.dylib`/`.a` filenames and in-process `DT_NEEDED` entries
+4. **Package resolution** (`mltp()` + `normalize()`) — each library name is normalized (e.g., `libfoo.so.1` → `["libfoo.so.1", "libfoo.so", "foo.so.1"]`) and looked up in the workspace library index; unmappable libraries are kept as raw `Library` entries
+5. **Consolidation** — when 2+ libraries resolve to the same package, the dependency's `libraries` field is populated (see [Consolidation])
+6. **Transitive resolution** (`transitive()` + `loadex()`) — walks the repository index to find transitive dependencies
 
-The Zero-Bloat Dependency Matcher orchestrates Components 1 and 2 together. Given one or more directory paths, it:
-
-1. Calls `elf()` on each directory to find all ELF binaries
-2. For each binary found, calls `strings()` to extract printable strings
-3. Passes the strings to `lib()` to extract library names
-4. Aggregates all results into a single, sorted, deduplicated list
-
-This function is designed to be called on multiple directories in sequence — first on `system/bin` (the package's own binaries), then on `system/lib` (any already-bundles libraries, for transitive dependency scanning).
-
-**Core system library classification function:** `is_core_system_lib(lib_name: &str) -> bool`
-
-Libraries that match known Cudane core prefixes are considered part of the base system and are NOT bundles into the package. This prevents unnecessary bloat while ensuring that third-party/supplemental libraries are still captured. The `CORE_SYSTEM_LIBS` constant contains an extensive list of known system libraries:
-
-- **C standard library**: `libc.so`, `libm.so`, `libpthread.so`, `libdl.so`, `librt.so`, `libutil.so`
-- **C++ runtime**: `libstdc++.so`, `libgcc_s.so`, `libatomic.so`, `libgomp.so`, `libquadmath.so`
-- **Sanitizers**: `libasan.so`, `libubsan.so`, `liblsan.so`, `libtsan.so`
-- **Compression**: `libz.so`, `libzstd.so`, `liblzma.so`, `libbz2.so`
-- **Cryptography**: `libssl.so`, `libcrypto.so`
-- **Regex**: `libpcre.so`, `libpcre2.so`
-- **XML, Unicode**: `libexpat.so`, `libffi.so`, `libiconv.so`, `libintl.so`
-- **Terminal**: `libncurses.so`, `libtinfo.so`, `libreadline.so`, `libhistory.so`
-- **Dynamic linker**: `ld-linux`, `ld-musl`, `ld-musl-x86_64`
-- **NSS**: `libnss_`, `libnss3.so`, `libnssutil3.so`
-- **Security**: `libselinux.so`, `libsepol.so`, `libpam.so`, `libcap.so`
-- **Filesystem**: `libacl.so`, `libattr.so`, `libmount.so`, `libblkid.so`, `libuuid.so`
-- **JSON**: `libjson-c.so`
-- **IPC**: `libdbus-1.so`
-- **Graphics**: `libEGL.so`, `libGL.so`, `libdrm_*.so`, `libX11.so`, `libxcb.so`, `libwayland-*.so`
-- **Audio**: `libpulse.so`, `libasound.so`, `libsndfile.so`
-- **Fonts**: `libfreetype.so`, `libfontconfig.so`, `libharfbuzz.so`
-- **Images**: `libpng`, `libjpeg`, `libwebp`, `libtiff`, `libgif`
-- **Scripting**: `libpython`, `libperl.so`
-- **Database**: `libsqlite3.so`
-- **And many more...**
-
-The matching uses both prefix checks and substring-in-name checks, so `libfoo.so.1.0.0` matches `libfoo.so` via the prefix test, and `libpthread-2.33.so` matches `libpthread.so` via a sliding window comparison.
-
-### Metadata Synchronization & Dependency Signature
-
-**Source function:** `compute(deps: &[[String]]) -> String`
-
-This component is the final piece of the Binary Reader architecture. It generates a deterministic SHA-256 hash over the sorted external dependency list. This serves as a **cryptographic signature** that:
-
-- Ensures the package's dependency metadata has not been tampered with
-- Allows verification that all expected bundles libraries are present at install time
-- Provides a unique fingerprint that can be compared against the manifest
-
-**Algorithm:**
-
-```shell
-SHA-256( join("|", sorted_deps) )
-```
-
-Where `sorted_deps` is the alphabetically sorted list of all external library names discovered by the two-phase scan. The pipe character (`|`) is used as the delimiter because it is highly unlikely to appear in a library name.
-
-The resulting 64-character hex string is stored in `PackageMetadata.depsig`.
-
-This signature is computed during `process()` after the dependency resolution phase and before the metadata is written to disk. It becomes a permanent part of the package metadata, embedded inside the `.xcs` archive alongside `metadata.json`.
-
-### Resolution by ldd
-
-The true power of `Outsider`'s dependency analysis comes from its **two-phase approach**:
-
-**Phase 1 (`ldd` — compile-time DT_NEEDED):**
-
-The traditional `ldd` command is still used as the first phase. It captures all **compile-time declared shared library dependencies** — i.e., the `DT_NEEDED` entries in the ELF dynamic section. These are the libraries listed in the binary's `.dynamic` section.
-
-`ldd` works by:
-
-1. Reading the ELF binary's `.dynamic` section to find `DT_NEEDED` entries
-2. Resolving each entry name (e.g., `libfoo.so.6`) to an actual file path using the system's library search paths (`/etc/ld.so.conf`, `LD_LIBRARY_PATH`, default paths like `/usr/lib`, `/lib`)
-3. Recursively repeating the process for each resolved library
-
-The output is a line-by-line listing showing each library name, its resolved path, and its load address. For example:
-
-```shell
-        linux-vdso.so.1 (0x00007ffd5a3e0000)
-        libfoo.so.6 => /usr/lib/x86_64-linux-gnu/libfoo.so.6 (0x00007f8a12340000)
-        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f8a12000000)
-        /lib64/ld-linux-x86-64.so.2 (0x00007f8a12400000)
-```
-
-**Phase 2 (Binary Reader — runtime dlopen/dlsym):**
-
-The Binary Reader opens each ELF binary (both executables and shared libraries) and reads it as a raw byte stream, extracting **all** printable strings of length >= 4 characters. This catches:
-
-- **Runtime dynamic loading**: Libraries loaded via `dlopen()`, `dlsym()`, or similar mechanisms. These are NOT visible to `ldd` because they are not declared in `DT_NEEDED`.
-- **Plugin architectures**: Programs that dynamically discover and load plugins (e.g., libpurple protocol plugins, Apache modules, GStreamer plugins) often embed plugin library names in string tables that are readable via byte scanning.
-- **Configuration-embedded paths**: Path strings embedded in `.rodata` or configuration data that reference shared libraries.
-- **Transitive dependencies**: When scanning already-bundles libraries in `system/lib`, the Binary Reader can discover dependencies of those libraries, which `ldd` may not resolve if the libraries are not on the system's library path.
-
-**Why two phases are necessary:**
-
-| Aspect | `ldd` Only | Binary Reader Only | Combined |
-| -------- | ----------- | ------------------- | ---------- |
-| Compile-time DT_NEEDED | ✅ | ✅ (via .dynstr) | ✅ |
-| Runtime dlopen/dlsym | ❌ | ✅ | ✅ |
-| Recursive transitive deps | ✅ | ✅ | ✅ |
-| Path resolution to real files | ✅ | ❌ (names only) | ✅ |
-| Cross-platform compatibility | ✅ | ✅ | ✅ |
-| Works with statically-linked bins | ❌ | ✅ (finds strings) | ✅ |
+Each discovered dependency records a human-readable `dep_type` (see [Metadata]), and multiple discovery routes for the same package are joined with ` & ` (e.g., `"Build (cargo) & Library (libfoo.so.1)"`).
 
 </details>
 
@@ -588,6 +474,7 @@ make install DESTDIR=/mnt     # staged install
 ### Meson
 
 ```shell
+./gen-cross.sh                              # generate cross file for host arch
 meson setup builddir --cross-file cross.txt --prefix=/system
 meson compile -C builddir
 meson install -C builddir
@@ -597,7 +484,7 @@ meson install -C builddir
 
 ```shell
 ninja -f build.ninja                       # build
-ninja -f build.ninja install DESTDIR=/mnt  # staged install
+DESTDIR=/mnt ninja -f build.ninja install  # staged install
 ```
 
 ### CMake
@@ -1535,7 +1422,7 @@ rustflags = ["-C", "target-cpu=armv8-a", ...]
 
 - [**`Package.arch`**] — Set per-package in the manifest (defaults to `"native"` for backward compatibility).
 - [**`OUS_TARGET`**] — Environment variable read by the auto Rust build to determine the `--target` triple.
-- **Arch-aware workspace** — Each arch gets its own workspace at `.os/<pkg>/<arch>/` to avoid rebuild conflicts when building the same package for multiple architectures.
+- **Arch-aware workspace** — Each arch gets its own workspace at `.ous/<pkg>/<arch>/` to avoid rebuild conflicts when building the same package for multiple architectures.
 - **Arch-specific index** — `index()` writes `index.<arch>.json` when the architecture is set, keeping per-arch metadata separate.
 
 </details>
@@ -1552,7 +1439,7 @@ Because `Outsider` delegates specialized operations to highly optimized system-l
 | [**`curl`**] | Handling remote archive downloads with robust error and status tracking. |
 | [**`tar`**] | Extracting source assets, staging layout tracking, and processing intermediate streams. |
 | [**`zstd`**] | Compression backend used by `tar` |
-| [**`ldd`**] | Phase 1 of the two-phase dependency scan: captures compile-time DT_NEEDED entries. |
+| [**`readelf`**] | Optional fallback for DT_NEEDED discovery only when the in-process ELF parser fails; not required on normal builds. |
 | [**`file`**] | Used by the `-i`/`--inspect` flag to determine the file type of a package. |
 
 </details>
@@ -1755,8 +1642,9 @@ This prints:
 7. **Hashing** (conditional): If the `hash` step is not marked complete, `hash()` computes checksums (SHA-256, SHA-1, MD5) of the entire `pkg/` directory. Results are persisted to `checksums.json`.
 
 8. **Dependency Resolution**: `scan()` performs the full dependency analysis:
+    - **Source-manifest scanning** (`scan_source_deps()`): Walks the unpacked source tree and extracts build-time dependency names from `Cargo.toml`, `package.json`, `meson.build`, `CMakeLists.txt`/`.cmake`, `configure.ac`/`configure`, and `.pc` files (skipping `target`, `.git`, `node_modules`, `vendor`, `build`, `dist`, `.os`, `__pycache__`, `.cargo`, `third_party`, and `deps`).
     - **Build-log parsing** (`cdd()`): Extracts package names from configure/meson/cmake output.
-    - **Library scanning** (`libdep()`): Reads ELF files and `.so` filenames to find needed libraries.
+    - **Library scanning** (`libdeps()`): Reads ELF `DT_NEEDED` entries in-process and collects `.so`/`.dll`/`.dylib`/`.a` filenames to find needed libraries.
     - **Package resolution** (`mltp()`): Maps each library to the package that provides it, using the workspace's `pkg/` directories as a library index.
     - **Consolidation**: When 2+ libraries resolve to the same package, the dependency's `libraries` field is populated (see [Consolidation]).
     - **Transitive resolution** (`transitive()`): Walks the repository index to find transitive dependencies.
@@ -1817,6 +1705,7 @@ make install DESTDIR=/mnt     # staged install
 ### Meson
 
 ```shell
+./gen-cross.sh                              # generate cross file for host arch
 meson setup builddir --cross-file cross.txt --prefix=/system
 meson compile -C builddir
 meson install -C builddir
@@ -1826,7 +1715,7 @@ meson install -C builddir
 
 ```shell
 ninja -f build.ninja                       # build
-ninja -f build.ninja install DESTDIR=/mnt  # staged install
+DESTDIR=/mnt ninja -f build.ninja install  # staged install
 ```
 
 ### CMake

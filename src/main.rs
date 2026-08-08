@@ -1,6 +1,5 @@
 pub mod config;
 pub mod utils;
-pub mod python;
 pub mod event;
 
 use crate::utils::ui::UserInterface;
@@ -12,12 +11,29 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process as sys_process;
+use std::sync::Arc;
+
+struct UiReporter;
+
+impl cps::Reporter for UiReporter {
+    fn info(&self, msg: &str) {
+        UserInterface::info(msg);
+    }
+    fn warning(&self, msg: &str) {
+        UserInterface::warning(msg);
+    }
+    fn error(&self, msg: &str) {
+        UserInterface::error(msg);
+    }
+}
 
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn main() -> Result<()> {
+    cps::configure(cps::Options::new("ous").with_reporter(Arc::new(UiReporter)));
+
     let mut args = env::args().skip(1).peekable();
     let mut manifest_path = String::new();
     let mut output_dir = String::new();
@@ -88,7 +104,7 @@ fn main() -> Result<()> {
                 let sub = args.next().unwrap_or_default();
                 match sub.as_str() {
                     "list" => {
-                        let plugins = python::plugin::PluginManager::list();
+                        let plugins = cps::plugin::PluginManager::list();
                         if plugins.is_empty() {
                             utils::UserInterface::info("No plugins registered.");
                         } else {
@@ -106,7 +122,7 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --plugin register <name> <path>");
                             sys_process::exit(1);
                         }
-                        python::plugin::PluginManager::register(&name, Path::new(&path), &HashMap::new());
+                        cps::plugin::PluginManager::register(&name, Path::new(&path), &HashMap::new());
                         utils::UserInterface::success(&format!("Plugin '{}' registered", name));
                         sys_process::exit(0);
                     }
@@ -116,7 +132,7 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --plugin unregister <name>");
                             sys_process::exit(1);
                         }
-                        python::plugin::PluginManager::unregister(&name);
+                        cps::plugin::PluginManager::unregister(&name);
                         utils::UserInterface::success(&format!("Plugin '{}' unregistered", name));
                         sys_process::exit(0);
                     }
@@ -128,8 +144,8 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --plugin run <name> <func> [args]");
                             sys_process::exit(1);
                         }
-                        match python::plugin::PluginManager::by_name(&name) {
-                            Some(entry) => match python::plugin::PluginManager::run(&entry, &func, &rest) {
+                        match cps::plugin::PluginManager::by_name(&name) {
+                            Some(entry) => match cps::plugin::PluginManager::run(&entry, &func, &rest) {
                                 Ok(out) => { println!("{}", out); }
                                 Err(e) => { utils::UserInterface::error(&e); sys_process::exit(1); }
                             },
@@ -147,7 +163,7 @@ fn main() -> Result<()> {
                 let sub = args.next().unwrap_or_default();
                 match sub.as_str() {
                     "list" => {
-                        let themes = python::theme::ThemeEngine::list();
+                        let themes = cps::theme::ThemeEngine::list();
                         if themes.is_empty() {
                             utils::UserInterface::info("No themes registered.");
                         } else {
@@ -168,7 +184,7 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --theme register <name> <path>");
                             sys_process::exit(1);
                         }
-                        python::theme::ThemeEngine::register(&name, Path::new(&path));
+                        cps::theme::ThemeEngine::register(&name, Path::new(&path));
                         utils::UserInterface::success(&format!("Theme '{}' registered", name));
                         sys_process::exit(0);
                     }
@@ -178,7 +194,7 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --theme unregister <name>");
                             sys_process::exit(1);
                         }
-                        python::theme::ThemeEngine::unregister(&name);
+                        cps::theme::ThemeEngine::unregister(&name);
                         utils::UserInterface::success(&format!("Theme '{}' unregistered", name));
                         sys_process::exit(0);
                     }
@@ -188,8 +204,8 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --theme apply <name>");
                             sys_process::exit(1);
                         }
-                        match python::theme::ThemeEngine::by_name(&name) {
-                            Some(entry) => match python::theme::ThemeEngine::apply(&entry) {
+                        match cps::theme::ThemeEngine::by_name(&name) {
+                            Some(entry) => match cps::theme::ThemeEngine::apply(&entry) {
                                 Ok(out) => { println!("{}", out); }
                                 Err(e) => { utils::UserInterface::error(&e); sys_process::exit(1); }
                             },
@@ -207,7 +223,7 @@ fn main() -> Result<()> {
                 let sub = args.next().unwrap_or_default();
                 match sub.as_str() {
                     "list" => {
-                        let tuis = python::tui::TuiEngine::list();
+                        let tuis = cps::tui::TuiEngine::list();
                         if tuis.is_empty() {
                             utils::UserInterface::info("No TUI apps registered.");
                         } else {
@@ -228,7 +244,7 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --tui register <name> <path>");
                             sys_process::exit(1);
                         }
-                        python::tui::TuiEngine::register(&name, Path::new(&path));
+                        cps::tui::TuiEngine::register(&name, Path::new(&path));
                         utils::UserInterface::success(&format!("TUI '{}' registered", name));
                         sys_process::exit(0);
                     }
@@ -238,7 +254,7 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --tui unregister <name>");
                             sys_process::exit(1);
                         }
-                        python::tui::TuiEngine::unregister(&name);
+                        cps::tui::TuiEngine::unregister(&name);
                         utils::UserInterface::success(&format!("TUI '{}' unregistered", name));
                         sys_process::exit(0);
                     }
@@ -248,8 +264,8 @@ fn main() -> Result<()> {
                             utils::UserInterface::error("Usage: ous --tui run <name>");
                             sys_process::exit(1);
                         }
-                        match python::tui::TuiEngine::by_name(&name) {
-                            Some(entry) => match python::tui::TuiEngine::apply(&entry) {
+                        match cps::tui::TuiEngine::by_name(&name) {
+                            Some(entry) => match cps::tui::TuiEngine::apply(&entry) {
                                 Ok(out) => { println!("{}", out); }
                                 Err(e) => { utils::UserInterface::error(&e); sys_process::exit(1); }
                             },

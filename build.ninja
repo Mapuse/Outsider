@@ -1,21 +1,34 @@
 # Outsider — build.ninja (auto-detects amd64/arm64)
 # Usage: ninja
-#        ninja install DESTDIR=/mnt PREFIX=/system/bin
+#        DESTDIR=/mnt ninja install
 
 rule cargo
-  command = sh -c 'case $$(uname -m) in x86_64) T=x86_64-unknown-linux-musl;; aarch64) T=aarch64-unknown-linux-musl;; *) echo "unsupported: $$(uname -m)"; exit 1;; esac; CARGO_TARGET_DIR=$$(pwd)/builddir/cargo cargo build --target $$T --release --locked --manifest-path $$(pwd)/Cargo.toml'
+  command = sh -c 'case $$(uname -m) in x86_64) T=x86_64-unknown-linux-musl;; aarch64) T=aarch64-unknown-linux-musl;; *) echo "unsupported: $$(uname -m)" >&2; exit 1;; esac; CARGO_TARGET_DIR=$$(pwd)/builddir/cargo cargo build --target $$T --release --locked --manifest-path $$(pwd)/Cargo.toml && cp $$(pwd)/builddir/cargo/$$T/release/ous "$out"'
   description = cargo build ous
 
 rule install
-  command = install -Dm755 $in $out
-  description = install $out
+  command = install -Dm755 $in $${DESTDIR}/system/bin/ous
+  description = install ous
 
-srcdir = .
+# cps is an external package: clone the upstream repo and build the cps
+# binary from that clone (host-side tool). Data files are installed by the
+# Makefile's `install-cps` target.
+rule cps
+  command = sh -c 'd=$$(pwd)/builddir/cps && (test -d "$$d/.git" || git clone --quiet https://github.com/Mapuse/CPS "$$d") && git -C "$$d" checkout --quiet d8d5f7da49917ea7636147b8a65f3541311c45ab && CARGO_TARGET_DIR=$$(pwd)/builddir/cargo-cps cargo build --release --locked --manifest-path "$$d/Cargo.toml" && cp $$(pwd)/builddir/cargo-cps/release/cps "$out"'
+  description = build cps package (from upstream clone)
+
+rule install-cps
+  command = install -Dm755 $in $${DESTDIR}/system/bin/cps
+  description = install cps
+
 builddir = builddir
-PREFIX ?= /system/bin
-DESTDIR ?=
 
 build $builddir/ous: cargo
 default $builddir/ous
 
-build $DESTDIR$(PREFIX)/ous: install $builddir/ous
+build install: install $builddir/ous
+
+build $builddir/cps: cps
+default $builddir/cps
+
+build cps-install: install-cps $builddir/cps

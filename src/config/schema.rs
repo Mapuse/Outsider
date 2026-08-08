@@ -106,28 +106,4 @@ impl Default for GpgConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PythonConfig {
-    pub enabled: bool,
-    pub theme: String,
-    pub tui: String,
-    pub plugins: Vec<String>,
-    pub fallback_on_error: bool,
-    pub venv_path: String,
-    pub tui_mode: bool,
-}
-
-impl Default for PythonConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            theme: default_empty(),
-            tui: default_empty(),
-            plugins: vec![],
-            fallback_on_error: true,
-            venv_path: default_empty(),
-            tui_mode: false,
-        }
-    }
-}
+pub use cps::PythonConfig;

@@ -23,4 +23,4 @@ md-5 = "0.10"
 chrono = "0.4.45"
 regex = "1.12.4"
 toml = "1.1"
-pyo3 = "0.25"
+cps = { git = "https://github.com/Mapuse/CPS", rev = "d8d5f7da49917ea7636147b8a65f3541311c45ab" }

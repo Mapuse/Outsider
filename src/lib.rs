@@ -8,8 +8,8 @@ use std::{collections::{HashMap, HashSet}, env, fs, io::Read, path::Path, path::
 
 pub mod config;
 pub mod utils;
-pub mod python;
 pub mod event;
+pub mod deps;
 use crate::utils::ui::UserInterface;
 
 fn sh_quote(value: &str) -> String {
@@ -512,9 +512,16 @@ fn license(src_dir: &str) -> String {
     "Unknown".into()
 }
 
-pub fn scan(dest_dir: &str, log_content: &str, current_pkg: &Package, repo_root: &Path) -> Result<Vec<Dependency>> {
+pub fn scan(dest_dir: &str, src_dir: &str, log_content: &str, current_pkg: &Package, repo_root: &Path) -> Result<Vec<Dependency>> {
     let mut deps_map: HashMap<String, HashSet<String>> = HashMap::new();
     let mut pkg_libs: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (name, dep_type) in crate::deps::scan_source_deps(src_dir) {
+        if name.eq_ignore_ascii_case(&current_pkg.name) {
+            continue;
+        }
+        deps_map.entry(name).or_default().insert(dep_type);
+    }
 
     for (name, dep_type) in cdd(log_content) {
         if name.eq_ignore_ascii_case(&current_pkg.name) {
@@ -523,7 +530,7 @@ pub fn scan(dest_dir: &str, log_content: &str, current_pkg: &Package, repo_root:
         deps_map.entry(name).or_default().insert(dep_type);
     }
 
-    let library_names = libdep(dest_dir)?;
+    let library_names = crate::deps::libdeps(dest_dir)?;
     let library_packages = mltp(repo_root, &current_pkg.arch)?;
 
     for lib in library_names {
@@ -642,47 +649,6 @@ fn cdd(log_content: &str) -> Vec<(String, String)> {
     results
 }
 
-fn libdep(dest_dir: &str) -> Result<HashSet<String>> {
-    let mut libs: HashSet<String> = HashSet::new();
-    let dest_path = Path::new(dest_dir);
-    let mut paths_to_check = vec![dest_path.to_path_buf()];
-
-    while let Some(current_dir) = paths_to_check.pop() {
-        if let Ok(entries) = fs::read_dir(&current_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    paths_to_check.push(path);
-                    continue;
-                }
-
-                if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && (name.ends_with(".so") || name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".a")) {
-                        libs.insert(name.to_string());
-                    }
-
-                if let Ok(mut f) = fs::File::open(&path) {
-                    let mut buf = [0; 4];
-                    if f.read_exact(&mut buf).is_ok() && &buf == b"\x7fELF"
-                        && let Ok(out) = Command::new("readelf").arg("-d").arg(&path).output() {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            for line in stdout.lines() {
-                                if line.contains("(NEEDED)")
-                                    && let Some(start) = line.find('[')
-                                        && let Some(end) = line.find(']') {
-                                            let lib = line[start + 1..end].to_string();
-                                            libs.insert(lib);
-                                        }
-                            }
-                        }
-                }
-            }
-        }
-    }
-
-    Ok(libs)
-}
-
 fn normalize(lib: &str) -> Vec<String> {
     let mut normalized = Vec::new();
     normalized.push(lib.to_string());
@@ -706,7 +672,7 @@ fn normalize(lib: &str) -> Vec<String> {
 
 fn mltp(repo_root: &Path, arch: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut library_packages: HashMap<String, Vec<String>> = HashMap::new();
-    let ous_root = repo_root.join(".os");
+    let ous_root = repo_root.join(".ous");
 
     if !ous_root.exists() {
         return Ok(library_packages);
@@ -812,7 +778,7 @@ fn transitive(
 }
 
 pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_content: &str, repo_root: &Path) -> Result<PackageMetadata> {
-    let dependencies = scan(dest, log_content, pkg, repo_root)?;
+    let dependencies = scan(dest, src_dir, log_content, pkg, repo_root)?;
     let pkg_files = files(dest)?;
     let provides = provides(dest)?;
 
@@ -985,7 +951,7 @@ pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
         entries.push(meta.clone());
     }
 
-    entries.sort_by(|a, b| (a.pkg_name.clone(), a.version.clone()).cmp(&(b.pkg_name.clone(), b.version.clone())));
+    entries.sort_by_key(|a| (a.pkg_name.clone(), a.version.clone()));
     let json = serde_json::to_string_pretty(&entries)?;
     fs::write(index_path, json)?;
     
@@ -1057,7 +1023,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     } else {
         format!("{}/{}", pkg.name, pkg.arch)
     };
-    let work_dir = current_dir.join(format!(".os/{}", arch_dir));
+    let work_dir = current_dir.join(format!(".ous/{}", arch_dir));
     let src_dir = work_dir.join("src");
     let pkg_root = work_dir.join("pkg");
     let state_path = work_dir.join(".state.json");

@@ -1,0 +1,61 @@
+.\" Outsider — Man Page
+.TH OUS 1 "2026-08-02" "ous 0.7.0" "User Commands"
+.SH NAME
+ous \- Outsider: the Cudane package builder
+.SH SYNOPSIS
+.B ous
+.RI [ options ]
+.SH DESCRIPTION
+.B ous
+builds and packages Cudane software into self-extracting archives (.xcs), and
+provides build-aware prompts, plugins, themes, and TUIs via the shared cps
+engine.
+.br
+It reads a manifest describing the build, stages the build output, and wraps it
+as a distributable archive. When run without a package operation it renders a
+build-aware prompt using the registered theme.
+.SH OPTIONS
+.TP
+.B \-a, \-\-archive \fIDIR\fR [\fIOUT.xcs\fR]
+Stage and package the built tree in
+.I DIR
+into an \fI.xcs\fR archive.
+.TP
+.B \-x, \-\-extract \fIFILE.xcs\fR
+Unpack an \fI.xcs\fR archive.
+.TP
+.B \-w, \-\-write \fIFILE\fR
+Generate package metadata for a manually constructed package.
+.TP
+.B \-b, \-\-hash-type \fIHASH\fR
+Select the checksum algorithm used for the archive.
+.TP
+.B \-\-plugin \fIlist|register|unregister|run\fR ...
+Manage cps plugins (run takes \fIname\fR [\fIfunc\fR] [\fIargs ...\fR]).
+.TP
+.B \-\-theme \fIlist|register|unregister|apply\fR ...
+Manage cps themes (\fIapply\fR renders a theme's prompt).
+.TP
+.B \-\-tui \fIlist|register|unregister|run\fR ...
+Manage cps TUIs.
+.TP
+.B \-h, \-\-help
+Show help.
+.TP
+.B \-v, \-\-version
+Show version.
+.SH FILES
+.TP
+.I manifest.toml
+Build manifest consumed by
+.BR ous .
+.TP
+.I t.desc , p.desc
+Theme and plugin descriptor files.
+.SH SEE ALSO
+.BR cps (1),
+.BR mcx (1)
+.SH AUTHOR
+Mapuse
+.SH LICENSE
+MIT

@@ -1,5 +1,5 @@
 REPO_ROOT   := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-SYSROOT     := $(REPO_ROOT)/rootfs
+SYSROOT     := /
 PREFIX      ?= /system
 
 # ── Auto-detect host architecture ──────────────────────────────────────
@@ -7,21 +7,21 @@ HOST_ARCH_RAW := $(shell uname -m)
 ifeq ($(HOST_ARCH_RAW),x86_64)
   ARCH         := amd64
   RUST_TARGET  := x86_64-unknown-linux-musl
-  GCC_TARGET   := x86_64-unknown-linux-musl
+  CLANG_TARGET := x86_64-unknown-linux-musl
   CMAKE_ARCH   := x86_64
   MESON_CPU    := x86_64
 else ifeq ($(HOST_ARCH_RAW),aarch64)
   ARCH         := arm64
   RUST_TARGET  := aarch64-unknown-linux-musl
-  GCC_TARGET   := aarch64-unknown-linux-musl
+  CLANG_TARGET := aarch64-unknown-linux-musl
   CMAKE_ARCH   := aarch64
   MESON_CPU    := aarch64
 else
   $(error Unsupported architecture: $(HOST_ARCH_RAW). Supported: x86_64, aarch64)
 endif
 
-CC            := clang --target=$(GCC_TARGET) --sysroot=$(SYSROOT)
-CXX           := clang++ --target=$(GCC_TARGET) --sysroot=$(SYSROOT)
+CC            := clang --target=$(CLANG_TARGET) --sysroot=$(SYSROOT)
+CXX           := clang++ --target=$(CLANG_TARGET) --sysroot=$(SYSROOT)
 AR            := llvm-ar
 STRIP         := llvm-strip
 

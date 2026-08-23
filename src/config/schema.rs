@@ -1,12 +1,31 @@
 use serde::{Deserialize, Serialize};
 
-fn default_false() -> bool { false }
-fn default_log_level() -> String { "info".into() }
-fn default_log_file() -> String { "/var/log/ous.md".into() }
-fn default_zstd_level() -> u32 { 3 }
-fn default_target_arch() -> String { "x86_64-unknown-linux-musl".into() }
-fn default_base_url() -> String { "https://raw.codeberg.org/Cudane/Repository".into() }
-fn default_empty() -> String { String::new() }
+fn default_false() -> bool {
+    false
+}
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_log_file() -> String {
+    "/var/log/ous.md".into()
+}
+fn default_zstd_level() -> u32 {
+    3
+}
+/// Host-appropriate musl target; matches the fallback in lib.rs.
+pub fn default_target_arch() -> String {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-musl".into()
+    } else {
+        "x86_64-unknown-linux-musl".into()
+    }
+}
+fn default_base_url() -> String {
+    "https://raw.codeberg.org/Cudane/Repository".into()
+}
+fn default_empty() -> String {
+    String::new()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,7 +37,6 @@ pub struct Config {
     pub gpg: GpgConfig,
     pub python: PythonConfig,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

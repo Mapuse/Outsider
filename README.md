@@ -55,13 +55,14 @@
 
 `Outsider` is built around a single principle: **declarative input, deterministic output**. You provide a JSON manifest describing what to build and how, and `Outsider` handles the rest — fetching source code, executing builds in isolation, scanning for runtime dependencies, generating metadata, and producing compressed archives.
 
-The codebase is split into three files:
+The codebase is split into a small set of modules:
 
 - [**`src/main.rs`**] — The CLI argument parser and entry point. It parses command-line flags, reads the manifest, and iterates over each package, calling into the library.
 - [**`src/lib.rs`**] — The core engine. Contains all data structures, the fetch/build/install pipeline, metadata generation, dependency injection, license detection, hashing, archiving, component scanning, service detection, sandbox profiling, repository indexing, and the **Binary Reader** dependency scanner.
 - [**`src/deps.rs`**] — The dependency-scanning primitives: an in-process ELF64 `DT_NEEDED` parser (`read_elf_needed`), the directory-tree library scanner (`libdeps`), and the source-manifest dependency extractor (`scan_source_deps`) for `Cargo.toml`, `package.json`, `meson.build`, `CMakeLists.txt`, `configure.ac`, and `.pc` files.
+- [**`src/config/`**] — The `ous.toml` configuration layer (`schema.rs` defines the typed config, `loader.rs` locates/loads it) and shared terminal UI helpers ([**`src/utils/ui.rs`**]).
 
-The engine uses [**`anyhow`**] for error handling with context propagation, [**`serde`**] for JSON serialization and deserialization, [**`sha2`**] for cryptographic hashing, [**`chrono`**] for timestamp generation, and [**`regex`**] for license pattern matching. External system tools (`git`, `curl`, `tar`, `file`) are invoked via `std::process::Command` rather than being linked as libraries, keeping the Rust binary lightweight and delegating specialized work to mature system utilities. ELF dependency discovery no longer shells out to `ldd` — it parses the `.dynamic` section in-process (see [Binary Reader]); `readelf` is used only as a fallback when the in-process parser fails.
+The engine uses [**`anyhow`**] for error handling with context propagation, [**`serde`**] for JSON serialization and deserialization, [**`sha2`**] for cryptographic hashing, and [**`regex`**] for license pattern matching. External system tools (`git`, `curl`, `tar`, `file`) are invoked via `std::process::Command` rather than being linked as libraries, keeping the Rust binary lightweight and delegating specialized work to mature system utilities. ELF dependency discovery no longer shells out to `ldd` — it parses the `.dynamic` section in-process (see [Binary Reader]); `readelf` is used only as a fallback when the in-process parser fails.
 
 </details>
 
@@ -70,7 +71,7 @@ The engine uses [**`anyhow`**] for error handling with context propagation, [**`
 The manifest is the single input file that drives the entire build pipeline. It is deserialized into the `Manifest` struct:
 
 ```rust
-#[[derive(Deserialize, Serialize, Clone)]]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Manifest {
     pub packages: Vec<Package>,
 }
@@ -85,19 +86,32 @@ pub struct Manifest {
 Each element in the `packages` array deserializes into a `Package`:
 
 ```rust
-#[[derive(Deserialize, Serialize, Clone)]]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Package {
     pub name: String,
     pub version: String,
     pub source: String,
+    #[serde(rename = "type")]
     pub build_type: String,
-    pub build_cmd: String,
-    pub install_cmd: String,
-    pub links: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    pub build: Vec<String>,
+    #[serde(default)]
+    pub install: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Option<Vec<DependencyEntry>>,
+    pub links: Option<HashMap<String, String>>,
+    #[serde(default = "default_arch")]
     pub arch: String,
-    pub services: Option<Vec<ServiceDecl>>,
-    pub components: Option<Vec<String>>,
-    pub binaries: Option<Vec<BinaryEntry>>,
+    #[serde(default)]
+    pub components: Option<Vec<ComponentSpec>>,
+    #[serde(default)]
+    pub services: Option<Vec<ServiceSpec>>,
+    #[serde(default)]
+    pub binaries: Option<Vec<String>>,
+    /// Optional expected SHA-256 of the downloaded source archive. When set,
+    /// the archive is verified after download and before extraction.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 ```
 
@@ -122,24 +136,25 @@ The origin of the source code. This field is processed by the `fetch()` function
 
 The `fetch()` function can also check for local existence first (before any protocol-based logic), so local paths always take precedence and avoid network access entirely.
 
-### build_type (String)
+### type (String)
 
-A classifier that influences how `Outsider` handles the package when `build_cmd` is empty. Common values include:
+A classifier that influences how `Outsider` handles the package when the `build` array is empty. Common values include:
 
-- `"rust"` — Triggers automatic `cargo build --release` with Cudane-specific `RUSTFLAGS` when `build_cmd` is empty.
-- `"meson"` — Informational; the actual build command must be provided in `build_cmd`.
-- `"make"` — Informational; the actual build command must be provided in `build_cmd`.
-- `"custom"` — Explicitly signals a custom build process; `build_cmd` and `install_cmd` are expected to be provided.
+- `"rust"` — Triggers automatic `cargo build --release` with Cudane-specific `RUSTFLAGS` when `build` is empty.
+- `"meson"` — Informational; the actual build commands must be provided in `build`.
+- `"make"` — Informational; the actual build commands must be provided in `build`.
+- `"custom"` — Explicitly signals a custom build process; `build` and `install` arrays are expected to be provided.
 
-The `build_type` is also stored in the output metadata for downstream tools to reference.
+The `type` value is also stored in the output metadata for downstream tools to reference. In the manifest JSON, this field is written as `"type"` (renamed via serde attribute).
 
-### build_cmd (String)
+### build (Vec\<String\>)
 
-The shell command to execute for building the package. The behavior depends on the content:
+An array of shell commands to execute sequentially for building the package. Each command runs in order; if any command fails, the build stops immediately (fail-fast). The array can contain zero or more commands.
 
-- **If the trimmed value equals** `"none"`, `"skip"`, or `"nothing"` (case-insensitive): The build step is completely skipped. No command runs, no automatic fallback occurs.
-- **If empty** (`""`) **and `OUS_NO_AUTO` is set**: The build step is skipped (returns empty log).
-- **If empty** (`""`) **and `build_type` is `"rust"`**: Automatic Rust build is triggered. The engine runs:
+**Behavior when the array is empty:**
+
+- If `OUS_NO_AUTO` is set: The build step is skipped (returns empty log).
+- If `type` is `"rust"`: Automatic Rust build is triggered. The engine runs:
 
 ```shell
 RUSTFLAGS="-C linker=clang -C link-arg=-target \
@@ -150,36 +165,73 @@ RUSTFLAGS="-C linker=clang -C link-arg=-target \
 
 Both stdout and stderr are captured into a `capture.log` file inside the source directory. If the build succeeds, the log content is returned for dependency scanning. If it fails, the error includes the full log output.
 
-- **If empty** (`""`) **and `build_type` is not `"rust"`**: The build step returns an empty string (no-op).
-- **If non-empty**: The command is executed via `sh -c` inside the source directory. Both stdout and stderr are captured using `tee` into `capture.log`, which is then read back and deleted. The log content is returned for dependency scanning.
+- If `type` is not `"rust"`: The build step returns an empty string (no-op).
 
-### install_cmd (String)
+**Behavior when the array has commands:**
 
-The shell command to install built artifacts into the staging directory. The behavior depends on the content:
+Each command in the array is processed as follows:
 
-- **If the trimmed value equals** `"none"`, `"skip"`, or `"nothing"` (case-insensitive): The install step is skipped, but any symlinks declared in the `links` map are still created.
-- **If empty** (`""`) **and `OUS_NO_AUTO` is set**: The install step is skipped (symlinks still processed).
-- **If empty** (`""`) **and `build_type` is `"rust"`**: Automatic Rust install is triggered. The engine copies all files from `target/release/` inside the source directory into the package staging directory. This provides a sensible default for Rust projects where the compiled binaries are placed in `target/release/`.
-- **If empty** (`""`) **and `build_type` is not `"rust"`**: Falls through to execute the empty string as a command (which would do nothing), then processes symlinks.
-- **If non-empty**: The command is executed via `sh -c` with the `CUDANE_DEST` environment variable set to the package staging directory path. The command runs with the source directory as its working directory. After the command completes, any symlinks in the `links` map are created.
+- If the trimmed command equals `"none"`, `"skip"`, or `"nothing"` (case-insensitive): That specific command is skipped and the next command is processed.
+- Otherwise: The command is executed via `sh -c` inside the source directory, with stdout and stderr combined and written to a `capture.log` file. The log file is read back and deleted after execution, and the real exit status is checked — a failing command aborts immediately with the full log attached, and remaining commands are not executed.
 
-### arch (String)
+All command logs are concatenated into a single log string returned by the function.
 
-The target architecture for the package. Supports multi-arch builds — common values are `"amd64"`, `"arm64"`, or `"native"` (which means build for the host architecture). When omitted from the manifest, it defaults to `"native"` for backward compatibility. The architecture is propagated into the package metadata and can be used by downstream tools to select the correct package variant for a given target platform.
+### install (Vec\<String\>)
 
-### services (Option<Vec<ServiceDecl>>)
+An array of shell commands to execute sequentially for installing built artifacts into the staging directory. Each command runs in order; if any command fails, the install stops immediately (fail-fast). The array can contain zero or more commands.
 
-An optional list of Cesar service declarations. When present, Outsider scans the staging directory for service files and records them in the package metadata. MCX uses this to automatically register/unregister services on install/remove.
+**Behavior when the array is empty:**
 
-### components (Option<Vec<String>>)
+- If `OUS_NO_AUTO` is set: The install step is skipped (symlinks still processed).
+- If `type` is `"rust"`: Automatic Rust install is triggered. The engine copies all files from `target/release/` inside the source directory into the package staging directory.
+- If `type` is not `"rust"`: Falls through to process symlinks only.
 
-An optional list of component tier classifications (e.g., `"required"`, `"recommended"`, `"optional"`, `"development"`). MCX uses this for partial install/upgrade/remove operations.
+**Behavior when the array has commands:**
 
-### binaries (Option<Vec<BinaryEntry>>)
+Each command in the array is processed as follows:
 
-An optional list of binary entries discovered in `system/bin/`. Each entry maps a command name to its binary path. MCX uses this for command-not-found resolution.
+- If the trimmed command equals `"none"`, `"skip"`, or `"nothing"` (case-insensitive): That specific command is skipped and the next command is processed.
+- Otherwise: The command is executed via `sh -c "<command>"` with the `CUDANE_DEST` environment variable set to the package staging directory path. The command runs with the source directory as its working directory. If the command fails, an error is returned immediately and remaining commands are not executed.
 
-### links (Option<HashMap<String, String>>)
+After all commands complete, any symlinks in the `links` map are created.
+
+### dependencies (Option\<Vec\<DependencyEntry\>\>)
+
+An optional array of dependency declarations. Each element can be either a simple package name string or a versioned object. The field accepts mixed formats in the same array.
+
+**Supported formats:**
+
+Simple strings (package name only):
+```json
+"dependencies": ["openssl", "zlib", "curl"]
+```
+
+Versioned objects (package name with version constraint):
+```json
+"dependencies": [{"name": "openssl", "version": ">=3.0"}]
+```
+
+Mixed (both forms in the same array):
+```json
+"dependencies": ["zlib", {"name": "openssl", "version": ">=3.0"}, "curl"]
+```
+
+The deserialization is handled by the `DependencyEntry` enum:
+
+```rust
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum DependencyEntry {
+    Simple(String),
+    Versioned { name: String, version: String },
+}
+```
+
+The `#[serde(untagged)]` attribute means serde tries each variant in order: first it attempts to deserialize as `Simple(String)`, and if that fails, it tries `Versioned { name, version }`. This allows both formats to coexist without explicit type tags in the JSON.
+
+These manifest-declared dependencies are separate from the auto-discovered dependencies that the Binary Reader and dependency scanner produce. They serve as explicit declarations when the user knows a dependency exists but it may not be automatically detected (for example, build-time tools or optional dependencies).
+
+### links (Option\<HashMap\<String, String\>\>)
 
 An optional map of symbolic links to create inside the package staging directory after installation. The map keys are the **target** paths (what the symlink points to) and the values are the **link** paths (where the symlink is placed). For example:
 
@@ -189,23 +241,61 @@ An optional map of symbolic links to create inside the package staging directory
 }
 ```
 
-This creates a symlink at `pkg_root/system/lib/libexample.so` that points to `system/lib/libexample.so.1`. The `symlink()` function handles the path logic: it strips leading slashes from the link path to keep it relative to the staging root, creates parent directories as needed, removes any existing file at the link location, and then creates the symlink using `std::osunix::fs::symlink`.
+This creates a symlink at `pkg_root/system/lib/libexample.so` that points to `system/lib/libexample.so.1`. The `symlink()` function handles the path logic: it strips leading slashes from the link path to keep it relative to the staging root, creates parent directories as needed, removes any existing file at the link location, and then creates the symlink using `std::os::unix::fs::symlink`.
+
+### arch (String)
+
+The target architecture for the package. Supports multi-arch builds — common values are `"amd64"`, `"arm64"`, or `"native"` (which means build for the host architecture). When omitted from the manifest, it defaults to `"native"`. The architecture is propagated into the package metadata and can be used by downstream tools to select the correct package variant for a given target platform.
+
+### components (Option\<Vec\<ComponentSpec\>\>)
+
+An optional list of component specifications. Each component is a `ComponentSpec` with a name, priority, file list, and optional description:
+
+```rust
+pub struct ComponentSpec {
+    pub name: String,
+    pub priority: String,    // "required", "recommended", "optional", "development"
+    pub files: Vec<String>,
+    pub description: String,
+}
+```
+
+MCX uses this for partial install/upgrade/remove operations.
+
+### services (Option\<Vec\<ServiceSpec\>\>)
+
+An optional list of Cesar service declarations. Each service is a `ServiceSpec` with a name, exec command, restart policy, and optional description:
+
+```rust
+pub struct ServiceSpec {
+    pub name: String,
+    pub exec: String,
+    pub requires: String,
+    pub restart: String,    // default: "on-failure"
+    pub description: String,
+}
+```
+
+When present, Outsider scans the staging directory for service files and records them in the package metadata. MCX uses this to automatically register/unregister services on install/remove.
+
+### binaries (Option\<Vec\<String\>\>)
+
+An optional list of binary command names. These are used for command-not-found resolution in downstream tools.
+
+### sha256 (Option\<String\>)
+
+An optional expected SHA-256 hex digest for the downloaded source archive. When set, `fetch()` hashes the archive with `sha256sum` immediately after download and fails the fetch before anything is extracted if the digests differ.
 
 </details>
 
 <details><summary id="symlinks">Symlinks</summary>
 
-Although the `Package` struct uses a raw `HashMap<String, String>` for links, there is also a dedicated `Symlink` struct in the codebase:
+The `links` map in `Package` is a raw `HashMap<String, String>` whose keys are target paths and whose values are link paths. The `symlink()` function that materializes them is hardened:
 
-```rust
-#[[derive(Deserialize, Serialize, Clone)]]
-pub struct Symlink {
-    pub target: String,
-    pub link: String,
-}
-```
-
-This struct is available for serialization and deserialization but is not currently used by the main pipeline — the `links` field in `Package` uses the HashMap directly. And the `Symlink` struct exists as a potential future expansion point for more structured symlink definitions.
+- The link path is stripped of its leading `/` and interpreted relative to the staging root; empty paths and trailing slashes are rejected.
+- Link paths containing `..` components are rejected outright, so a manifest can never place a symlink outside the staging root.
+- After creating parent directories, the parent is canonicalized and verified to still live inside the staging root (defending against intermediate symlinks pointing elsewhere).
+- Any existing file at the link location is removed before the new symlink is created.
 
 </details>
 
@@ -239,8 +329,6 @@ Each field is populated as follows:
 - [**`source`**]: Mirrored directly from the manifest's `source` field.
 - [**`arch`**]: Mirrored directly from the manifest's `arch` field. Defaults to `""` when absent (backward compat with older metadata).
 - [**`license`**]: Determined by the `license()` function, which scans the source directory for license files and extracts the license name using regex pattern matching.
-- [**`build_type`**]: Mirrored directly from the manifest's `build_type` field.
-- [**`build_date`**]: An ISO 8601 UTC timestamp generated at runtime via `chrono::Utc::now().to_rfc3339()`, recording exactly when the metadata was created.
 - [**`checksum`**]: A SHA-256 hex digest of the entire package staging directory, computed by `hash()` which pipes the directory through `tar -cf -` and hashes the resulting byte stream.
 - [**`provides`**]: Using `libdep` and `normalize` to list the libraries that the package provides.
 - [**`conflicts`**]: Using `scan` to scan for any conflicting links and list it.
@@ -356,7 +444,7 @@ The parser uses a `while let Some(arg) = args.next()` loop with a `match` on eac
 
 4. **`-h` / `--help`**: Prints the help message and exits with code 0.
 
-5. **`-v` / `--version`**: Prints the version string `"Outsider 0.5.0"` and exits with code 0.
+5. **`-v` / `--version`**: Prints the version string `"Outsider 0.7.0"` and exits with code 0.
 
 6. **`-a` / `--archive`**: Takes two positional arguments (staging directory and output package path) and runs `tar` directly to create an `.xcs` archive manually.
 
@@ -452,7 +540,7 @@ Each discovered dependency records a human-readable `dep_type` (see [Metadata]),
 
 ## Installation
 
-All build systems auto-detect `x86_64`/`aarch64` and select the correct musl target. Cross-compilation files are in `env.mk`, `toolchain.cmake`, and `cross.txt` (generated via `gen-cross.sh`).
+All build systems auto-detect `x86_64`/`aarch64` and select the correct musl target. Cross-compilation defaults live in `env.mk` (Make) and `toolchain.cmake` (CMake); meson and ninja need no extra files. The pinned `cps` revision is shared through `CPS_REV` in `env.mk`.
 
 ### Cargo (direct)
 
@@ -474,8 +562,7 @@ make install DESTDIR=/mnt     # staged install
 ### Meson
 
 ```shell
-./gen-cross.sh                              # generate cross file for host arch
-meson setup builddir --cross-file cross.txt --prefix=/system
+meson setup builddir -Dprefix=/system -Dprofile=release
 meson compile -C builddir
 meson install -C builddir
 ```
@@ -483,8 +570,9 @@ meson install -C builddir
 ### Ninja
 
 ```shell
-ninja -f build.ninja                       # build
-DESTDIR=/mnt ninja -f build.ninja install  # staged install
+ninja -f build.ninja                       # build ous
+DESTDIR=/mnt ninja -f build.ninja install  # staged install (PREFIX defaults to /system)
+ninja -f build.ninja cps-install           # also fetch/build/install cps + its data
 ```
 
 ### CMake
@@ -503,13 +591,13 @@ cmake --install build
 ```
 
 > [!TIP]
-> When `--no-auto` is passed, the program sets the `OUS_NO_AUTO` environment variable to disable the auto behaviors for empty `build_cmd` and `install_cmd` fields.
+> When `--no-auto` is passed, the program sets the `OUS_NO_AUTO` environment variable to disable the auto behaviors for empty `build` and `install` arrays.
 
 ## Building Variables
 
 ### Building only / Direct destination
 
-in `install_cmd`, type:
+In the `install` array, use a command that sets `DESTDIR` directly:
 
 ```shell
 DESTDIR=/your/dest/path
@@ -517,7 +605,7 @@ DESTDIR=/your/dest/path
 
 ### Building a package (Building + Archiving)
 
-in `install_cmd`, type:
+In the `install` array, reference the `$CUDANE_DEST` variable:
 
 ```shell
 DESTDIR=$CUDANE_DEST
@@ -525,7 +613,7 @@ DESTDIR=$CUDANE_DEST
 
 > [!TIP]
 > **Why `$CUDANE_DEST`**?
-> Outsider uses this variable to configure the package setup by your `build_cmd` + `install_cmd` commands, and passing the output to the `archive` function.
+> Outsider uses this variable to configure the package setup by your `build` and `install` commands, and passing the output to the `archive` function.
 
 > [!WARNING]
 > Ignoring or not setting a destination variable causes the engine to install the package inside the temporary working folder as the final system destination, so better for you choose one of these two options.
@@ -594,9 +682,9 @@ The simplest way to ensure correct organization is to use install commands that 
 {
   "name": "my-app",
   "version": "1.0.0",
-  "build_type": "make",
-  "build_cmd": "make -j$(nproc)",
-  "install_cmd": "make DESTDIR=$CUDANE_DEST install prefix=/system",
+  "type": "make",
+  "build": ["make -j$(nproc)"],
+  "install": ["make DESTDIR=$CUDANE_DEST install prefix=/system"],
   "links": {
     "system/bin/my-app": "system/bin/my-app-v1"
   }
@@ -669,30 +757,27 @@ The `--depth 1` flag limits the clone to only the most recent commit, minimizing
 pub fn build(pkg: &Package, dir: &str) -> Result<String>
 ```
 
-This function executes the build command for a package and returns the captured build log as a `String`. The return value is used by the dependency scanner (though the current codebase does not perform deep dependency scanning from logs — the log is captured for potential future use or external tooling).
+This function executes the build commands for a package and returns the captured build log as a `String`. The return value is used by the dependency scanner (though the current codebase does not perform deep dependency scanning from logs — the log is captured for potential future use or external tooling).
 
 **Decision tree:**
 
-1. **Skip keywords**: If `build_cmd` (trimmed) equals `"none"`, `"skip"`, or `"nothing"` (case-insensitive comparison via `eq_ignore_ascii_case`), the function returns an empty string immediately. No build occurs.
+1. **Empty build array with `OUS_NO_AUTO`**: If `pkg.build` is empty and the `OUS_NO_AUTO` environment variable is set, the function returns an empty string. This gives users explicit control to disable automatic behaviors.
 
-2. **Empty command with `OUS_NO_AUTO`**: If `build_cmd` is empty and the `OUS_NO_AUTO` environment variable is set, the function returns an empty string. This gives users explicit control to disable automatic behaviors.
-
-3. **Empty command with `build_type == "rust"`**: The automatic Rust build is triggered:
+2. **Empty build array with `type == "rust"`**: The automatic Rust build is triggered:
     - The `RUSTFLAGS` environment variable is set to Cudane-specific values: linker is `clang`, target is `x86_64-unknown-linux-musl`, sysroot is `/system`, and static CRT is enabled.
     - `cargo build --target x86_64-unknown-linux-musl --release` is executed in the source directory.
     - Both stdout and stderr are captured into a single `log_content` string.
     - The log is written to `capture.log` in the source directory.
     - If the build succeeds, the log content is returned. If it fails, the error includes the full log output for debugging.
 
-4. **Empty command with other build types**: Returns an empty string (no-op).
+3. **Empty build array with other build types**: Returns an empty string (no-op).
 
-5. **Non-empty command**: The command is executed via:
-
-```shell
-sh -c "(<command>) 2>&1 | tee capture.log"
-```
-
-The command is wrapped in parentheses to capture all output, `2>&1` redirects stderr to stdout, and `tee` writes the output to `capture.log` while also displaying it (though in a non-interactive context, the display effect is minimal). After execution, the log file is read into memory and deleted. If the command succeeds, the log content is returned; otherwise, an error is returned.
+4. **Non-empty build array**: Each command in the `pkg.build` vector is executed sequentially:
+    - If the trimmed command equals `"none"`, `"skip"`, or `"nothing"` (case-insensitive comparison via `eq_ignore_ascii_case`), that command is skipped and the next command is processed.
+    - Otherwise, the command is executed via `sh -c "(<command>) 2>&1 | tee capture.log"` inside the source directory.
+    - The command is executed via `sh -c` with stdout and stderr combined and captured into `capture.log`. After execution, the log file is read into memory and deleted, and the real exit status is checked.
+    - If any command fails, an error is returned immediately (with the captured log attached) and remaining commands are not executed.
+    - All command logs are concatenated into a single log string returned by the function.
 
 ## install - Staging Installation
 
@@ -704,25 +789,21 @@ This function installs built artifacts from the source directory into the packag
 
 **Decision tree:**
 
-1. **Skip keywords**: If `install_cmd` (trimmed) equals `"none"`, `"skip"`, or `"nothing"` (case-insensitive), the install command is skipped. However, any symlinks declared in `pkg.links` are still created. This allows packages to declare symlinks without running any install command.
+1. **Empty install array with `OUS_NO_AUTO`**: Install is skipped, symlinks are still processed.
 
-2. **Empty command with `OUS_NO_AUTO`**: Same as above — install is skipped, symlinks are still processed.
-
-3. **Empty command with `build_type == "rust"`**: The automatic Rust install is triggered:
+2. **Empty install array with `type == "rust"`**: The automatic Rust install is triggered:
     - The function looks for `target/release/` inside the source directory.
     - If the directory exists, it iterates over all entries.
     - For each file (not directory) in `target/release/`, it copies the file to the package staging directory, overwriting any existing file with the same name.
     - After copying, any symlinks in `pkg.links` are created.
 
-4. **Non-empty command**: The command is executed via:
+3. **Empty install array with other build types**: Falls through to process symlinks only.
 
-```shell
-sh -c "<install_cmd>"
-```
-
-The `CUDANE_DEST` environment variable is set to the package staging directory path, and `CUDANE_PREFIX` is set to the package's prefix (e.g., `"system"`, `"usr"`). The command runs with the source directory as its working directory (`current_dir(src)`). This allows install commands to reference `$CUDANE_DEST` as the target root and `$CUDANE_PREFIX` to target the correct installation prefix. After the command completes, any symlinks in `pkg.links` are created.
-
-1. **Empty command with other build types**: Falls through to execute the empty string as a command (which effectively does nothing in a shell), then processes symlinks.
+4. **Non-empty install array**: Each command in the `pkg.install` vector is executed sequentially:
+    - If the trimmed command equals `"none"`, `"skip"`, or `"nothing"` (case-insensitive), that command is skipped and the next command is processed.
+    - Otherwise, the command is executed via `sh -c "<command>"` with the `CUDANE_DEST` environment variable set to the package staging directory path. The command runs with the source directory as its working directory (`current_dir(src)`). This allows install commands to reference `$CUDANE_DEST` as the target root.
+    - If any command fails, an error is returned immediately and remaining commands are not executed.
+    - After all commands complete, any symlinks in `pkg.links` are created.
 
 ## symlink - Symbolic Link Management
 
@@ -930,7 +1011,7 @@ Requires `gpg` to be available on the system.
 
 ### State File
 
-Each package's workspace contains a state file at `.ous/{package_name}/.state.json`:
+Each package's workspace contains a state file at `.ous/{package_name}/{arch}/.state.json` (the arch segment keeps rebuilds of the same package for different architectures isolated):
 
 ```rust
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -954,14 +1035,14 @@ The following step identifiers are tracked:
 
 1. When `process()` starts, it checks for `.state.json` in the package workspace.
 2. If the file exists and `OUS_CLEAN` is **not** set, the state is loaded and only steps **not** in `completed_steps` are executed.
-3. After each successful step, the state file is updated atomically (written via `serde_json` + `fs::write`).
+3. After each successful step, the state file is updated atomically (written to a temporary sibling and renamed into place).
 4. Intermediate outputs are persisted:
    - Build log → `ous.log`
    - Checksums → `checksums.json`
 
 ### Overwrite / Force
 
-- **`-f` / `--force`** (sets `OUS_FORCE=1`): Ignores the existing `.xcs` output file and rebuilds from scratch (or resumes from workspace state).
+- **`-f` / `--force`** (sets `OUS_FORCE=1`): Skips the short-circuit check for an existing `.xcs` output file and forces re-running the archive/hash/metadata tail steps even when the resume state marks them complete. Fetch/build/install progress is still honored, so a resumed build only redoes the packaging tail.
 - **`-c` / `--clean`** (sets `OUS_CLEAN=1`): Deletes the entire workspace directory before starting, ensuring a completely fresh build.
 
 ### Use Case
@@ -1074,7 +1155,7 @@ path = "~/Outsider/themes/minimal.py"
 description = "Minimal single-line prompt with exit-code indicator"
 ```
 
-`name` is the display name, `path` the Python file (absolute or `~`-expanded), and `description` is optional. Registered themes/TUIs are managed with `ous --theme list|register|unregister|apply` and `ous --tui list|register|unregister|run`. Both `apply` and `run` execute the file out-of-process via `python3 <path>`. `ous --theme list` and `ous --tui list` show `name (path) — description` for entries that have a description.
+`name` is the display name, `path` the Python file (absolute or `~`-expanded), and `description` is optional. Themes/TUIs are listed with `ous --theme list` / `ous --tui list` (`name (path) — description` for entries that have a description) and applied with `ous --theme apply` / `ous --tui run`; both execute the file out-of-process via `python3 <path>`. There is no `register`/`unregister` subcommand: to add or remove an entry, edit `t.desc` directly.
 
 ### Alias system
 
@@ -1163,7 +1244,7 @@ When Outsider fires a hook, it passes a JSON event to your plugin. The event is 
 | `package` | string or null | Package name being built |
 | `version` | string or null | Package version |
 | `source` | string or null | Source URL or path |
-| `build_type` | string or null | Build type (e.g., `"rust"`, `"make"`, `"custom"`) |
+| `type` | string or null | Build type (e.g., `"rust"`, `"make"`, `"custom"`) |
 | `work_dir` | string or null | Working directory for the build |
 | `root_dir` | string or null | Target root directory |
 | `output_path` | string or null | Output path for archives |
@@ -1173,18 +1254,21 @@ When Outsider fires a hook, it passes a JSON event to your plugin. The event is 
 
 | Hook | When it fires |
 | ---- | ------------- |
-| `pre-fetch` | Before fetching source code |
-| `post-fetch` | After fetching source code |
-| `pre-build` | Before building the package |
-| `post-build` | After building the package |
-| `pre-install` | Before installing artifacts to staging |
-| `post-install` | After installing artifacts to staging |
-| `pre-hash` | Before computing checksums |
-| `post-hash` | After computing checksums |
-| `pre-metadata` | Before generating metadata |
-| `post-metadata` | After generating metadata |
-| `pre-archive` | Before compressing to .xcs |
-| `post-archive` | After compressing to .xcs |
+| `pre_fetch` | Before fetching source code |
+| `post_fetch` | After fetching source code |
+| `pre_build` | Before building the package |
+| `post_build` | After building the package |
+| `pre_install` | Before installing artifacts to staging |
+| `post_install` | After installing artifacts to staging |
+| `pre_hash` | Before computing checksums |
+| `post_hash` | After computing checksums |
+| `pre_metadata` | Before generating metadata |
+| `post_metadata` | After generating metadata |
+| `pre_archive` | Before compressing to .xcs |
+| `post_archive` | After compressing to .xcs |
+
+Hooks are enabled by listing plugin files under `[python].plugins` in
+`ous.toml`; each hook receives a `package` keyword argument.
 
 #### Reading the event in Python
 
@@ -1284,8 +1368,8 @@ The CLI supports the following flags, each of which sets a corresponding environ
 | `-z` | `--zstd-level <NUM>` | `OUS_ZSTD_LEVEL=<NUM>` | Set zstd compression level for tar (default: 3) |
 | `-s` | `--strict` | `OUS_STRICT=1` | Fail immediately on dependency mapping errors |
 | `-d` | `--debug` | `OUS_DEBUG=1` | Enable verbose debug logging |
+| `-q` | `--quiet` | `OUS_QUIET=1` | Suppress non-error output |
 | `-y` | `--yes` | `OUS_ASSUME_YES=1` | Assume yes to all prompts |
-| `-k` | `--keep-src` | `OUS_KEEP_SRC=1` | Do not delete source directory after build |
 | `-p` | `--project <DIR>` | `OUS_PROJECT_WORKSPACE=<DIR>` | Define custom project or workspace directory |
 
 ### Standalone Modes
@@ -1375,23 +1459,14 @@ This design allows the index to be incrementally updated as new packages are bui
 
 </details>
 
-<details><summary id="multiarch">Multi-Architecture Pipeline</summary>
+<details><summary id="multiarch">Multi-Architecture Builds</summary>
 
-`Outsider` supports building packages for multiple target architectures from a single manifest. The pipeline is driven by the `CUDANE_TARGETS` environment variable and the included `pipeline.sh` script.
-
-### Usage
+`Outsider` builds for one target architecture per invocation; drive multiple architectures by running the engine once per target:
 
 ```shell
-export CUDANE_TARGETS="x86_64-unknown-linux-musl,aarch64-unknown-linux-musl"
-./pipeline.sh manifest.json
+OUS_TARGET=x86_64-unknown-linux-musl  ous manifest.json output/x86_64/
+OUS_TARGET=aarch64-unknown-linux-musl ous manifest.json output/aarch64/
 ```
-
-For each target, the pipeline:
-
-1. Sets `OUS_TARGET` to the target triple, which is read by the engine's auto-build path to pass `--target <triple>` to `cargo`.
-2. Creates `output/<arch>/` for built `.xcs` packages.
-3. Writes `index.<arch>.json` with arch-specific package metadata.
-4. Moves packages into `pool/<arch>/<name>/` for organized storage.
 
 ### Standard Rustup Targets
 
@@ -1402,11 +1477,11 @@ Outsider uses standard Rustup musl targets — no custom `.json` target specs re
 | `x86_64-unknown-linux-musl` | amd64, x86-64-v3, musl |
 | `aarch64-unknown-linux-musl` | arm64, armv8-a, musl |
 
-Install them with `rustup target add <triple>`. To add a new architecture, install its target via rustup and add its triple to `CUDANE_TARGETS`.
+Install them with `rustup target add <triple>`. To add a new architecture, install its rustup target and pass the triple via `OUS_TARGET` (or `-t/--target`).
 
 ### Cargo Configuration
 
-Each target has a corresponding section in `cargo/config.toml` with target-specific `rustflags`:
+Per-target linker/rustflags live in `.cargo/config.toml`, e.g.:
 
 ```toml
 [target.x86_64-unknown-linux-musl]
@@ -1483,7 +1558,7 @@ rustup target add x86_64-unknown-linux-musl
 rustup target add aarch64-unknown-linux-musl
 ```
 
-The engine reads the `OUS_TARGET` environment variable to determine which `--target` triple to pass to `cargo` during automatic Rust builds. Set it before invoking the engine, or use `pipeline.sh` with `CUDANE_TARGETS` for multi-arch builds.
+The engine reads the `OUS_TARGET` environment variable to determine which `--target` triple to pass to `cargo` during automatic Rust builds. Set it before invoking the engine (or use `-t/--target`) and run one build per target architecture.
 
 ### 4. Complete Toolchain Agility
 
@@ -1622,6 +1697,7 @@ This prints:
 
 - The file path and size (in bytes and MB).
 - The file type (from the `file` command).
+- Integrity verification against the detached `package.xcs.sha256` sidecar written at packaging time. If the sidecar is missing, the computed hashes are shown with a warning instead — embedded `metadata.json` is deliberately *not* used for verification, since anyone tampering with the archive could rewrite it too.
 
 </details>
 
@@ -1635,9 +1711,9 @@ This prints:
 
 4. **Source Fetching** (conditional): If the `fetch` step is not marked complete in the state file, `fetch()` retrieves the source code into `src/` using the appropriate method (local copy, git clone, or curl+tar download). On success, the state file is updated.
 
-5. **Build Execution** (conditional): If the `build` step is not marked complete, `build()` executes the build command in the `src/` directory. For Rust packages with empty `build_cmd`, automatic `cargo build --release` is triggered with Cudane-specific flags. The build log is persisted to `ous.log` for resume.
+5. **Build Execution** (conditional): If the `build` step is not marked complete, `build()` executes the build commands in the `src/` directory. For Rust packages with empty `build` array, automatic `cargo build --release` is triggered with Cudane-specific flags. The build log is persisted to `ous.log` for resume.
 
-6. **Installation** (conditional): If the `install` step is not marked complete, `install()` copies built artifacts from `src/` to `pkg/`. For Rust packages with empty `install_cmd`, files from `target/release/` are automatically copied.
+6. **Installation** (conditional): If the `install` step is not marked complete, `install()` copies built artifacts from `src/` to `pkg/`. For Rust packages with empty `install` array, files from `target/release/` are automatically copied.
 
 7. **Hashing** (conditional): If the `hash` step is not marked complete, `hash()` computes checksums (SHA-256, SHA-1, MD5) of the entire `pkg/` directory. Results are persisted to `checksums.json`.
 
@@ -1667,7 +1743,7 @@ This prints:
 | Profile | Command | Flags | Use case |
 | ------- | ------- | ----- | -------- |
 | Debug | `cargo build` | — | Development iteration, fast compile |
-| Release | `cargo build --release` | `opt-level = 3`, `lto = true`, `strip = true` | Production binary, minimised size |
+| Release | `cargo build --release` | `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true` | Production binary, minimised size |
 | Check | `cargo check` | — | Compile-only verification, no artifacts |
 
 ```shell
@@ -1681,9 +1757,28 @@ cargo build
 cargo build --release
 ```
 
+### Feature flags
+
+| Feature | Default | Enables |
+| ------- | ------- | ------- |
+| `python` | off | cps Python subsystem: plugins, themes and TUIs through an embedded interpreter |
+
+The default build is fully native and thin — no `pyo3`, no `libpython` linked. The `cps` engine is lazy: even in a `python` build the interpreter only initialises when a plugin/theme/TUI is actually configured, and is finalised on exit.
+
+```shell
+# Thin default build (no Python)
+cargo build --release
+
+# With Python subsystem
+cargo build --release --features python
+
+# Compile-only verification of the opt-in path
+cargo check --features python
+```
+
 ## Installation
 
-All build systems auto-detect `x86_64`/`aarch64` and select the correct musl target. Cross-compilation files are in `env.mk`, `toolchain.cmake`, and `cross.txt` (generated via `gen-cross.sh`).
+All build systems auto-detect `x86_64`/`aarch64` and select the correct musl target. Cross-compilation defaults live in `env.mk` (Make) and `toolchain.cmake` (CMake); meson and ninja need no extra files.
 
 ### Cargo (direct)
 
@@ -1705,8 +1800,7 @@ make install DESTDIR=/mnt     # staged install
 ### Meson
 
 ```shell
-./gen-cross.sh                              # generate cross file for host arch
-meson setup builddir --cross-file cross.txt --prefix=/system
+meson setup builddir -Dprefix=/system -Dprofile=release
 meson compile -C builddir
 meson install -C builddir
 ```
@@ -1714,8 +1808,9 @@ meson install -C builddir
 ### Ninja
 
 ```shell
-ninja -f build.ninja                       # build
-DESTDIR=/mnt ninja -f build.ninja install  # staged install
+ninja -f build.ninja                       # build ous
+DESTDIR=/mnt ninja -f build.ninja install  # staged install (PREFIX defaults to /system)
+ninja -f build.ninja cps-install           # also fetch/build/install cps + its data
 ```
 
 ### CMake
@@ -1737,16 +1832,14 @@ mcx -i outsider
 | Crate | Purpose |
 |-------|---------|
 | serde | Serialization framework |
-| toml | TOML config file parser |
-| dirs | Platform-specific config paths |
-| glob | File glob pattern matching |
-| libc | POSIX syscall bindings |
-| serde_json | JSON serialization |
-| crossterm | Terminal raw mode, events, colors |
-| sha2 | Cryptographic hashing |
-| chrono | Timestamp generation |
-| regex | License pattern matching |
+| serde_json | JSON serialization (manifests, metadata, index) |
+| toml | TOML config file parser (`ous.toml`) |
 | anyhow | Error handling with context |
+| regex | Version/index pattern matching |
+| tar | Archive creation/extraction (.xcs payloads) |
+| zstd | Compression for .xcs packages |
+| sha1 / sha2 / md-5 | Checksum algorithms for package hashing |
+| cps | Python plugin/theme/TUI subsystem |
 
 ## Testing
 
@@ -1788,7 +1881,7 @@ cargo audit
 
 ```shell
 # Build with debug assertions enabled in release
-cargo build --profile release-debug  # requires Cargo.toml profile
+cargo build  # debug profile includes debug assertions
 
 # Run with RUST_LOG for tracing
 RUST_LOG=debug ous
@@ -1821,26 +1914,21 @@ perf stat -e cycles,instructions,cache-misses,faults ./target/release/ous
 
 ## Continuous integration
 
+CI runs via GitHub Actions (`.github/workflows/rust.yml`) on every push/PR to `master`, on both `amd64` (`ubuntu-latest`) and `arm64` (`ubuntu-24.04-arm`) runners. Each job runs, in order:
+
 ```yaml
-# Expected CI pipeline (GitHub Actions)
 steps:
-  - name: Checkout
-    run: git checkout ${{ github.ref }}
-
-  - name: Build
-    run: cargo build --release
-
-  - name: Test
-    run: cargo test --release
-
-  - name: Lint
-    run: cargo clippy -- -D warnings
-
-  - name: Format
+  - name: Check formatting
     run: cargo fmt --check
 
-  - name: Audit
-    run: cargo audit
+  - name: Clippy
+    run: cargo clippy --all-targets -- -D warnings
+
+  - name: Build
+    run: cargo build --verbose
+
+  - name: Run tests
+    run: cargo test --verbose
 ```
 
 ## Cargo.toml release profile
@@ -1865,4 +1953,4 @@ strip = true          # Strip symbols
 
 ## License
 
-**MIT License** ─ See [**`[LICENSE]`**](https://github.com/Mapuse/Outsider/blob/master/LICENSE) for More Details.
+**MIT License** ─ See [**`[LICENSE]`**](https://github.com/Mapuse/.github/blob/profile/LICENSE) for More Details.

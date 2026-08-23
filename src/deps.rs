@@ -8,11 +8,16 @@ use std::process::Command;
 
 // ── ELF parsing (no external binutils required) ──────────────────────────
 
-fn read_at(file: &mut fs::File, offset: u64, len: usize) -> Result<Vec<u8>> {
+fn read_at(file: &mut fs::File, offset: u64, len: u64) -> Result<Vec<u8>> {
+    // Hostile headers can declare absurd dyn/strtab sizes; never allocate
+    // more than the file actually contains past `offset`.
+    let file_len = file.metadata()?.len();
+    let available = file_len.saturating_sub(offset);
+    let wanted = len.min(available).min(usize::MAX as u64) as usize;
     file.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; len];
+    let mut buf = vec![0u8; wanted];
     let mut filled = 0;
-    while filled < len {
+    while filled < wanted {
         let n = file.read(&mut buf[filled..])?;
         if n == 0 {
             break;
@@ -54,7 +59,11 @@ pub fn read_elf_needed(path: &Path) -> Result<Vec<String>> {
     let mut dyn_size: Option<u64> = None;
 
     for i in 0..phnum as u64 {
-        let ph = read_at(&mut file, phoff.saturating_add(i.saturating_mul(phentsize as u64)), 56)?;
+        let ph = read_at(
+            &mut file,
+            phoff.saturating_add(i.saturating_mul(phentsize as u64)),
+            56,
+        )?;
         if ph.len() < 56 {
             break;
         }
@@ -80,7 +89,7 @@ pub fn read_elf_needed(path: &Path) -> Result<Vec<String>> {
         None => return Ok(Vec::new()),
     };
 
-    let dyn_bytes = read_at(&mut file, dyn_off, dyn_size as usize)?;
+    let dyn_bytes = read_at(&mut file, dyn_off, dyn_size)?;
 
     let mut strtab_vaddr: Option<u64> = None;
     let mut strtab_size: Option<u64> = None;
@@ -110,17 +119,21 @@ pub fn read_elf_needed(path: &Path) -> Result<Vec<String>> {
         None => return Ok(Vec::new()),
     };
 
-    let strtab = read_at(&mut file, strtab_off, strtab_size as usize)?;
+    let strtab = read_at(&mut file, strtab_off, strtab_size)?;
 
     let mut result = Vec::new();
     for str_off in needed_offsets {
         let off = str_off as usize;
         if off < strtab.len() {
-            let end = strtab[off..].iter().position(|&b| b == 0).unwrap_or(strtab.len() - off);
+            let end = strtab[off..]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(strtab.len() - off);
             if end >= 4
-                && let Ok(name) = std::str::from_utf8(&strtab[off..off + end]) {
-                    result.push(name.to_string());
-                }
+                && let Ok(name) = std::str::from_utf8(&strtab[off..off + end])
+            {
+                result.push(name.to_string());
+            }
         }
     }
 
@@ -152,9 +165,13 @@ pub fn libdeps(dest_dir: &str) -> Result<HashSet<String>> {
                 }
 
                 if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && (name.ends_with(".so") || name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".a")) {
-                        libs.insert(name.to_string());
-                    }
+                    && (name.ends_with(".so")
+                        || name.ends_with(".dll")
+                        || name.ends_with(".dylib")
+                        || name.ends_with(".a"))
+                {
+                    libs.insert(name.to_string());
+                }
 
                 if is_elf(&path) {
                     match read_elf_needed(&path) {
@@ -169,9 +186,10 @@ pub fn libdeps(dest_dir: &str) -> Result<HashSet<String>> {
                                 for line in stdout.lines() {
                                     if line.contains("(NEEDED)")
                                         && let Some(start) = line.find('[')
-                                            && let Some(end) = line.find(']') {
-                                                libs.insert(line[start + 1..end].to_string());
-                                            }
+                                        && let Some(end) = line.find(']')
+                                    {
+                                        libs.insert(line[start + 1..end].to_string());
+                                    }
                                 }
                             }
                         }
@@ -189,8 +207,17 @@ pub fn libdeps(dest_dir: &str) -> Result<HashSet<String>> {
 type DepSet = HashSet<(String, String)>;
 
 const SKIP_DIRS: &[&str] = &[
-    "target", ".git", "node_modules", "vendor", "build", "dist", ".os",
-    "__pycache__", ".cargo", "third_party", "deps",
+    "target",
+    ".git",
+    "node_modules",
+    "vendor",
+    "build",
+    "dist",
+    ".os",
+    "__pycache__",
+    ".cargo",
+    "third_party",
+    "deps",
 ];
 
 /// Walk the unpacked source tree and extract build-time dependency names from
@@ -206,9 +233,10 @@ pub fn scan_source_deps(src_dir: &str) -> Vec<(String, String)> {
                 let path = entry.path();
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                        && SKIP_DIRS.contains(&name) {
-                            continue;
-                        }
+                        && SKIP_DIRS.contains(&name)
+                    {
+                        continue;
+                    }
                     stack.push(path);
                 } else if path.is_file() {
                     scan_file(&path, &mut deps);
@@ -254,9 +282,10 @@ fn cargo_deps(path: &Path, deps: &mut DepSet) {
         tables.push(toml_value.get(section).and_then(|v| v.as_table()));
     }
     if let Some(workspace) = toml_value.get("workspace").and_then(|v| v.as_table())
-        && let Some(ws_deps) = workspace.get("dependencies").and_then(|v| v.as_table()) {
-            tables.push(Some(ws_deps));
-        }
+        && let Some(ws_deps) = workspace.get("dependencies").and_then(|v| v.as_table())
+    {
+        tables.push(Some(ws_deps));
+    }
 
     for table in tables.into_iter().flatten() {
         for key in table.keys() {
@@ -272,7 +301,12 @@ fn npm_deps(path: &Path, deps: &mut DepSet) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
         return;
     };
-    for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] {
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
         if let Some(obj) = value.get(section).and_then(|v| v.as_object()) {
             for key in obj.keys() {
                 deps.insert((key.clone(), "Build (npm)".to_string()));
@@ -305,16 +339,15 @@ fn autotools_deps(path: &Path, deps: &mut DepSet) {
     let Ok(content) = fs::read_to_string(path) else {
         return;
     };
-    let pkgconfig_re = Regex::new(
-        r#"(?i)PKG_CHECK_MODULES\s*\(\s*[^,]+,\s*['"]?([A-Za-z0-9_+\-./]+)['"]?"#,
-    ).expect("valid regex");
+    let pkgconfig_re =
+        Regex::new(r#"(?i)PKG_CHECK_MODULES\s*\(\s*[^,]+,\s*['"]?([A-Za-z0-9_+\-./]+)['"]?"#)
+            .expect("valid regex");
     for caps in pkgconfig_re.captures_iter(&content) {
         deps.insert((caps[1].to_string(), "Build (pkg-config)".to_string()));
     }
 
-    let check_lib_re = Regex::new(
-        r#"(?i)AC_CHECK_LIB\s*\(\s*['"]?([A-Za-z0-9_+-]+)['"]?"#,
-    ).expect("valid regex");
+    let check_lib_re =
+        Regex::new(r#"(?i)AC_CHECK_LIB\s*\(\s*['"]?([A-Za-z0-9_+-]+)['"]?"#).expect("valid regex");
     for caps in check_lib_re.captures_iter(&content) {
         deps.insert((caps[1].to_string(), "Build (autotools)".to_string()));
     }
@@ -384,6 +417,61 @@ mod tests {
         let names: Vec<String> = deps.into_iter().map(|(n, _)| n).collect();
         assert!(names.contains(&"libpcre2-8".to_string()));
         assert!(names.contains(&"zlib".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // m11: a hostile PT_DYNAMIC p_filesz must not trigger a huge allocation;
+    // the parser clamps reads to the file length and returns an empty result.
+    #[test]
+    fn test_elf_hostile_dynamic_size_capped() {
+        let dir = std::env::temp_dir().join(format!("ous-elf-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hostile.elf");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x7fELF");
+        buf.push(2); // ELFCLASS64
+        buf.extend_from_slice(&[0u8; 8]); // e_ident padding
+        buf.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        buf.extend_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+        buf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+        buf.extend_from_slice(&64u64.to_le_bytes()); // e_phoff — right after header
+        buf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+        buf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        buf.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        buf.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        buf.extend_from_slice(&2u16.to_le_bytes()); // e_phnum: PT_LOAD + PT_DYNAMIC
+
+        // PT_LOAD covering the whole (tiny) file at vaddr 0.
+        let load = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            p.extend_from_slice(&7u32.to_le_bytes()); // RWX flags
+            p.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+            p.extend_from_slice(&0u64.to_le_bytes()); // p_vaddr
+            p.extend_from_slice(&(buf.len() as u64 + 128).to_le_bytes()); // p_filesz
+            p.extend_from_slice(&(buf.len() as u64 + 128).to_le_bytes()); // p_memsz
+            p
+        };
+        // PT_DYNAMIC claiming an absurd 4 GiB segment.
+        let dyn_seg = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+            p.extend_from_slice(&0u32.to_le_bytes());
+            p.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+            p.extend_from_slice(&0u64.to_le_bytes()); // p_vaddr
+            p.extend_from_slice(&0xFFFF_FFFFu64.to_le_bytes()); // p_filesz — hostile
+            p.extend_from_slice(&0xFFFF_FFFFu64.to_le_bytes()); // p_memsz
+            p
+        };
+        buf.extend_from_slice(&load);
+        buf.extend_from_slice(&dyn_seg);
+        fs::write(&path, &buf).unwrap();
+
+        // Must return Ok(empty) quickly instead of attempting a 4 GiB read.
+        let needed = read_elf_needed(&path).expect("must not error");
+        assert!(needed.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

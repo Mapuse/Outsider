@@ -1,60 +1,188 @@
 .\" Outsider — Man Page
-.TH OUS 1 "2026-08-02" "ous 0.7.0" "User Commands"
+.TH OUS 1 "2026-08-22" "ous 0.7.0" "User Commands"
 .SH NAME
 ous \- Outsider: the Cudane package builder
 .SH SYNOPSIS
 .B ous
 .RI [ options ]
+.I MANIFEST OUTPUT_DIR
+.br
+.B ous
+.RB [ \-a | \-\-archive ]
+.I SRC OUT.xcs
+.br
+.B ous
+.RB [ \-x | \-\-extract ]
+.I PACKAGE.xcs|DIR ROOT
+.br
+.B ous
+.RB [ \-i | \-\-inspect ]
+.I PACKAGE.xcs
+.br
+.B ous \-\-sort
+.I DIR ARCH
+.br
+.B ous \-\-validate
+.I INDEX.json DIR
+.br
+.B ous \-\-checksum
+.I INDEX.json DIR
+.RB [ \-\-base\-url
+.IR URL ]
+.RB [ \-\-arch
+.IR ARCH ]
+.br
+.B ous \-\-source
+.I INDEX.json
+.RB [ \-\-base\-url
+.IR URL ]
+.RB [ \-\-arch
+.IR ARCH ]
+.br
+.B ous
+.RB [ \-g | \-\-sign ]
+.I INDEX.json DIR
+.RB [ \-\-key
+.IR KEYID ]
 .SH DESCRIPTION
 .B ous
 builds and packages Cudane software into self-extracting archives (.xcs), and
 provides build-aware prompts, plugins, themes, and TUIs via the shared cps
 engine.
 .br
-It reads a manifest describing the build, stages the build output, and wraps it
-as a distributable archive. When run without a package operation it renders a
-build-aware prompt using the registered theme.
-.SH OPTIONS
+It reads a JSON manifest describing the build, fetches sources, builds each
+package, stages the output, and wraps it as a distributable archive with a
+detached SHA-256 sidecar file.
+.SH BUILD OPTIONS
 .TP
-.B \-a, \-\-archive \fIDIR\fR [\fIOUT.xcs\fR]
-Stage and package the built tree in
-.I DIR
-into an \fI.xcs\fR archive.
+.B \-m, \-\-manifest \fIFILE\fR
+Path to the manifest.json describing the packages to build.
 .TP
-.B \-x, \-\-extract \fIFILE.xcs\fR
-Unpack an \fI.xcs\fR archive.
+.B \-o, \-\-output \fIDIR\fR
+Directory that receives the built .xcs archives.
 .TP
-.B \-w, \-\-write \fIFILE\fR
-Generate package metadata for a manually constructed package.
+.B \-t, \-\-target \fIARCH\fR
+Target architecture triple (e.g. x86_64-unknown-linux-musl).
 .TP
-.B \-b, \-\-hash-type \fIHASH\fR
-Select the checksum algorithm used for the archive.
+.B \-n, \-\-no\-auto
+Disable automatic build/install behaviors.
 .TP
-.B \-\-plugin \fIlist|register|unregister|run\fR ...
-Manage cps plugins (run takes \fIname\fR [\fIfunc\fR] [\fIargs ...\fR]).
+.B \-f, \-\-force
+Overwrite existing .xcs packages; forces re-running the archive/hash/metadata
+steps even when a resume state marks them complete.
 .TP
-.B \-\-theme \fIlist|register|unregister|apply\fR ...
-Manage cps themes (\fIapply\fR renders a theme's prompt).
+.B \-c, \-\-clean
+Clean the package workspace before building.
 .TP
-.B \-\-tui \fIlist|register|unregister|run\fR ...
-Manage cps TUIs.
+.B \-l, \-\-parallel
+Process manifest entries in parallel.
 .TP
-.B \-h, \-\-help
-Show help.
+.B \-j, \-\-jobs \fINUM\fR
+Maximum number of parallel jobs/workers.
 .TP
-.B \-v, \-\-version
-Show version.
+.B \-z, \-\-zstd\-level \fINUM\fR
+zstd compression level, 1–22 (default: 3).
+.TP
+.B \-s, \-\-strict
+Fail when libraries cannot be resolved to a providing package.
+.TP
+.B \-d, \-\-debug
+Enable verbose debug logging.
+.TP
+.B \-q, \-\-quiet
+Suppress non-error output.
+.TP
+.B \-y, \-\-yes
+Assume "yes" for all confirmation prompts.
+.TP
+.B \-p, \-\-project \fIDIR\fR
+Use DIR as the project workspace root instead of the current directory.
+.SH STANDALONE COMMANDS
+.TP
+.B \-a, \-\-archive \fISRC\fR \fIOUT.xcs\fR
+Archive directory SRC into an .xcs tar+zstd archive.
+.TP
+.B \-x, \-\-extract \fIPACKAGE\fR \fIROOT\fR
+Extract an .xcs package (or every *.xcs inside a directory) into rootfs ROOT.
+.TP
+.B \-w, \-\-write \fISRC\fR \fIDEST\fR
+Generate metadata.json for a manually constructed package tree.
+.TP
+.B \-i, \-\-inspect \fIPACKAGE.xcs\fR
+Show size, timestamps, and integrity of a package; verifies against the
+detached \fIPACKAGE.sha256\fR sidecar when present.
+.TP
+.B \-b, \-\-hash\-type \fITYPE\fR
+Checksum algorithm: sha256 (default), sha1 or md5.
+.SH REPOSITORY COMMANDS
+.TP
+.B \-\-sort \fIDIR\fR \fIARCH\fR
+Sort .xcs files into pool/\fIARCH\fR/\fIname\fR/ layout. Refuses to overwrite
+an existing destination unless \fB\-\-force\fR is given or confirmed.
+.TP
+.B \-\-validate \fIINDEX.json\fR \fIDIR\fR
+Check index/package consistency; exits non-zero on problems.
+.TP
+.B \-\-checksum \fIINDEX.json\fR \fIDIR\fR
+Add SHA-256 sums and rewritten source URLs to the index.
+.TP
+.B \-\-source \fIINDEX.json\fR
+Rewrite source URLs in the index to pool paths.
+.TP
+.B \-g, \-\-sign \fIINDEX.json\fR \fIDIR\fR
+GPG-detach-sign the index and every .xcs package.
+.TP
+.B \-\-base\-url \fIURL\fR, \fB\-\-arch \fIARCH\fR, \fB\-\-key \fIKEYID\fR
+Repository modifiers consumed by the preceding commands; they may appear
+before or after the command they modify.
+.SH PLUGIN / THEME / TUI
+.TP
+.B \-\-plugin \fIlist|run|reload\fR ...
+List, run (\fIname func [args...]\fR) or reload cps plugins.
+.TP
+.B \-\-theme \fIlist|apply\fR ...
+List or apply cps themes.
+.TP
+.B \-\-tui \fIlist|run\fR ...
+List or run cps TUI apps.
+.PP
+Registering and unregistering plugins/themes/TUIs from the CLI is not
+supported: descriptors are managed by editing the \fIp.desc\fR / \fIt.desc\fR
+files directly.
+.SH ENVIRONMENT
+.TP
+.B OUS_TARGET, OUS_JOBS, OUS_PARALLEL, OUS_FORCE, OUS_CLEAN, OUS_NO_AUTO,
+.B OUS_STRICT, OUS_DEBUG, OUS_QUIET, OUS_ASSUME_YES, OUS_ZSTD_LEVEL,
+.B OUS_HASH_TYPE, OUS_PROJECT_WORKSPACE
+Equivalent to the like-named command line options; flags take precedence.
+.TP
+.B CUDANE_REPO_URL, CUDANE_TARGET
+Fallback base URL / architecture for repository commands.
+.TP
+.B GPG_KEY_ID
+Fallback signing key for \fB--sign\fR.
 .SH FILES
 .TP
-.I manifest.toml
-Build manifest consumed by
+.I manifest.json
+JSON build manifest consumed by
 .BR ous .
 .TP
-.I t.desc , p.desc
-Theme and plugin descriptor files.
+.I ous.toml
+Optional per-project configuration (see config documentation); values are
+exposed through the OUS_* environment unless overridden by CLI flags.
+.TP
+.I PACKAGE.xcs.sha256
+Detached SHA-256 sidecar written next to every packaged archive.
+.TP
+.I p.desc , t.desc
+Plugin and theme/TUI descriptor files managed by cps.
+.SH EXIT STATUS
+0 on success; 1 on operational failure (including unconfirmed prompts and
+duplicate manifest entries); 2 when \fB--hash-type\fR receives an unknown
+algorithm; \fB--validate\fR exits with the number of problems found (capped
+at 255).
 .SH SEE ALSO
-.BR cps (1),
-.BR mcx (1)
+.BR cps (1)
 .SH AUTHOR
 Mapuse
 .SH LICENSE

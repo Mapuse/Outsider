@@ -1,0 +1,6 @@
+option('profile',
+  type : 'combo',
+  choices : ['release', 'debug'],
+  value : 'release',
+  description : 'Cargo profile used to build ous.',
+)

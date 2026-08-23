@@ -1,34 +1,43 @@
 # Outsider — build.ninja (auto-detects amd64/arm64)
-# Usage: ninja
-#        DESTDIR=/mnt ninja install
+# Usage:
+#   ninja                          build ous only
+#   ninja $builddir/cps            also build the cps companion binary
+#   ninja install                  install ous + man page   (PREFIX/DESTDIR honored)
+#   ninja cps-install              install cps + its data    (PREFIX/DESTDIR honored)
+#
+# Variables: DESTDIR (staging root), PREFIX (default /system),
+#            PROFILE (release|dev), CPS_REV (cps commit; must match env.mk).
+
+builddir = builddir
 
 rule cargo
-  command = sh -c 'case $$(uname -m) in x86_64) T=x86_64-unknown-linux-musl;; aarch64) T=aarch64-unknown-linux-musl;; *) echo "unsupported: $$(uname -m)" >&2; exit 1;; esac; CARGO_TARGET_DIR=$$(pwd)/builddir/cargo cargo build --target $$T --release --locked --manifest-path $$(pwd)/Cargo.toml && cp $$(pwd)/builddir/cargo/$$T/release/ous "$out"'
+  command = sh -c 'case $$(uname -m) in x86_64) T=x86_64-unknown-linux-musl;; aarch64) T=aarch64-unknown-linux-musl;; *) echo "unsupported: $$(uname -m)" >&2; exit 1;; esac; P=$${PROFILE:-release}; D=$$P; [ "$$P" = dev ] && D=debug; CARGO_TARGET_DIR=$$(pwd)/$builddir/cargo cargo build --target $$T --profile $$P --locked --manifest-path $$(pwd)/Cargo.toml && cp $$(pwd)/$builddir/cargo/$$T/$$D/ous "$out"'
   description = cargo build ous
 
 rule install
-  command = install -Dm755 $in $${DESTDIR}/system/bin/ous
+  command = install -Dm755 $in $${DESTDIR}$${PREFIX:-/system}/bin/ous
   description = install ous
 
+rule install-man
+  command = install -Dm644 $in $${DESTDIR}$${PREFIX:-/system}/share/man/man1/ous.1
+  description = install man page
+
 # cps is an external package: clone the upstream repo and build the cps
-# binary from that clone (host-side tool). Data files are installed by the
-# Makefile's `install-cps` target.
+# binary from that clone (host-side tool). The literal below MUST stay in
+# sync with CPS_REV in env.mk and Cargo.toml; CPS_REV overrides it.
 rule cps
-  command = sh -c 'd=$$(pwd)/builddir/cps && (test -d "$$d/.git" || git clone --quiet https://github.com/Mapuse/CPS "$$d") && git -C "$$d" checkout --quiet d8d5f7da49917ea7636147b8a65f3541311c45ab && CARGO_TARGET_DIR=$$(pwd)/builddir/cargo-cps cargo build --release --locked --manifest-path "$$d/Cargo.toml" && cp $$(pwd)/builddir/cargo-cps/release/cps "$out"'
+  command = sh -c 'd=$$(pwd)/$builddir/cps && (test -d "$$d/.git" || git clone --quiet https://github.com/Mapuse/CPS "$$d") && git -C "$$d" checkout --quiet $${CPS_REV:-c4ba21e185398558052acec3f0b4619b4e8c0678} && CARGO_TARGET_DIR=$$(pwd)/$builddir/cargo-cps cargo build --release --locked --manifest-path "$$d/Cargo.toml" && cp $$(pwd)/$builddir/cargo-cps/release/cps "$out"'
   description = build cps package (from upstream clone)
 
 rule install-cps
-  command = install -Dm755 $in $${DESTDIR}/system/bin/cps
-  description = install cps
-
-builddir = builddir
+  command = install -Dm755 $in $${DESTDIR}$${PREFIX:-/system}/bin/cps && d=$$(dirname $in) && sd=$${DESTDIR}$${PREFIX:-/system}/share/cps && install -d $$sd/themes $$sd/examples && (test ! -d $$d/../themes || install -m644 $$d/../themes/*.py $$sd/themes/) && (test ! -f "$$d/t.desc" || install -m644 $$d/t.desc $$sd/) && (test ! -f "$$d/p.desc" || install -m644 $$d/p.desc $$sd/) && (test ! -d "$$d/examples" || install -m644 $$d/examples/*.py $$sd/examples/)
+  description = install cps binary and data
 
 build $builddir/ous: cargo
 default $builddir/ous
 
 build install: install $builddir/ous
+build install-man: install-man docs/ous.1
 
 build $builddir/cps: cps
-default $builddir/cps
-
 build cps-install: install-cps $builddir/cps

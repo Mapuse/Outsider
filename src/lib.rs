@@ -1,25 +1,204 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use md5::{Digest as _, Md5};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use md5::{Digest as _, Md5};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::{collections::{HashMap, HashSet}, env, fs, io::Read, path::Path, path::PathBuf, process::Command};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    io::Read,
+    path::Path,
+    path::PathBuf,
+    process::Command,
+};
 
 pub mod config;
-pub mod utils;
-pub mod event;
 pub mod deps;
+pub mod utils;
 use crate::utils::ui::UserInterface;
 
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+use std::sync::{Mutex, OnceLock};
+
+/// Write `bytes` to `path` atomically: a temporary sibling file in the same
+/// directory is written, fsynced, then renamed over the target so readers
+/// never observe a truncated file even if the process dies mid-write.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir)?;
+    let name = path.file_name().map_or_else(
+        || "ous.tmp".to_string(),
+        |n| n.to_string_lossy().to_string(),
+    );
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{}.tmp-{}-{}", name, std::process::id(), nanos));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-pub struct Symlink {
-    pub target: String,
-    pub link: String,
+/// Parse `OUS_ZSTD_LEVEL`, clamping to the range zstd supports (1..=22).
+/// Invalid values fall back to the default (3) with a warning.
+pub fn zstd_level_from_env() -> u32 {
+    match env::var("OUS_ZSTD_LEVEL") {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(lvl) if (1..=22).contains(&lvl) => lvl,
+            _ => {
+                UserInterface::warning(&format!(
+                    "Invalid OUS_ZSTD_LEVEL '{raw}' — falling back to default level 3"
+                ));
+                3
+            }
+        },
+        Err(_) => 3,
+    }
+}
+
+/// Validate a raw version string interpolated into the output filename:
+/// rejects empty values, path separators and `..` traversal.
+fn validate_version_component(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.contains('/')
+        || value.split('/').any(|c| c == "..")
+        || value.contains("..")
+    {
+        return Err(anyhow!(
+            "Invalid {label} '{value}': '/', '..' and empty values are forbidden"
+        ));
+    }
+    Ok(())
+}
+
+/// Directory has at least one entry (used to sanity-check resume markers).
+fn dir_non_empty(p: &Path) -> bool {
+    fs::read_dir(p)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Parse a `<name>-<version>.xcs` filename, tolerating prerelease suffixes
+/// in the version (`1.0-beta`, `2.0.0-rc.1`). Returns `(name, version)`.
+pub fn parse_xcs_name(fname: &str) -> Option<(String, String)> {
+    let stem = fname.strip_suffix(".xcs")?;
+    let bytes = stem.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let rest = &stem[i + 1..];
+            // The version must start with a dotted numeric core; whatever
+            // trails it is only acceptable as an empty string, a '-'-led
+            // prerelease suffix (which may itself contain dots), or a dot-free
+            // appended tag such as "rc1". This keeps garbage like
+            // "3.2.1.tar.gz" from parsing as a version.
+            let base_end = rest
+                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(rest.len());
+            let base = rest[..base_end].trim_end_matches('.');
+            if base.is_empty() {
+                continue;
+            }
+            let tail = &rest[base_end..];
+            let plausible = tail.is_empty()
+                || (tail.starts_with('-')
+                    && tail[1..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+')))
+                || (!tail.starts_with('.')
+                    && !tail.contains('.')
+                    && tail
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+')));
+            if plausible {
+                let name = &stem[..i];
+                if name.is_empty() {
+                    return None;
+                }
+                return Some((name.to_string(), rest.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Natural-aware sort key for version strings: runs of digits compare
+/// numerically (`1.10` sorts after `1.9`), other runs compare as lowercase
+/// text. Deterministic total order.
+fn version_sort_key(v: &str) -> Vec<(bool, u64, String)> {
+    fn chunk(s: &str, is_num: bool) -> (bool, u64, String) {
+        if is_num {
+            (true, s.parse().unwrap_or(u64::MAX), String::new())
+        } else {
+            (false, 0, s.to_lowercase())
+        }
+    }
+    let mut parts: Vec<(bool, u64, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_is_num: Option<bool> = None;
+    for c in v.chars() {
+        let is_num = c.is_ascii_digit();
+        if cur_is_num != Some(is_num) && !cur.is_empty() {
+            parts.push(chunk(&cur, cur_is_num.unwrap_or(false)));
+            cur.clear();
+        }
+        cur_is_num = Some(is_num);
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        parts.push(chunk(&cur, cur_is_num.unwrap_or(false)));
+    }
+    parts
+}
+
+#[allow(dead_code)] // unused when compiled without the `python` feature
+static PLUGIN_MANAGER: OnceLock<Mutex<cps::plugin::PluginManager>> = OnceLock::new();
+
+/// Load plugins declared under `[python].plugins` in ous.toml so pipeline
+/// hooks can fire into them. No-op without the `python` feature.
+pub fn init_plugins(cfg: &cps::PythonConfig) {
+    #[cfg(feature = "python")]
+    {
+        let mgr = PLUGIN_MANAGER.get_or_init(|| Mutex::new(cps::plugin::PluginManager::new()));
+        if let Ok(mut m) = mgr.lock() {
+            m.load_all(cfg);
+        }
+    }
+    #[cfg(not(feature = "python"))]
+    {
+        let _ = cfg;
+    }
+}
+
+/// Fire a lifecycle hook (`pre-fetch`, `post-build`, …) into loaded plugins.
+/// Hook callables use underscores in Python (`pre_fetch`); the name is
+/// normalized automatically. Best-effort: never fails the pipeline.
+pub fn fire_hook(hook: &str, package: &str) {
+    #[cfg(feature = "python")]
+    {
+        let normalized = hook.replace('-', "_");
+        if let Some(mgr) = PLUGIN_MANAGER.get()
+            && let Ok(m) = mgr.lock()
+        {
+            let mut data = HashMap::new();
+            data.insert("package".to_string(), package.to_string());
+            m.fire(&normalized, &data);
+        }
+    }
+    #[cfg(not(feature = "python"))]
+    {
+        let _ = (hook, package);
+    }
+}
+
+/// Quote a value for safe interpolation into a POSIX `sh -c` command string.
+pub fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -52,14 +231,26 @@ fn default_restart() -> String {
     "on-failure".into()
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum DependencyEntry {
+    Simple(String),
+    Versioned { name: String, version: String },
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Package {
     pub name: String,
     pub version: String,
     pub source: String,
+    #[serde(rename = "type")]
     pub build_type: String,
-    pub build_cmd: String,
-    pub install_cmd: String,
+    #[serde(default)]
+    pub build: Vec<String>,
+    #[serde(default)]
+    pub install: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Option<Vec<DependencyEntry>>,
     pub links: Option<std::collections::HashMap<String, String>>,
     #[serde(default = "default_arch")]
     pub arch: String,
@@ -69,6 +260,10 @@ pub struct Package {
     pub services: Option<Vec<ServiceSpec>>,
     #[serde(default)]
     pub binaries: Option<Vec<String>>,
+    /// Optional expected SHA-256 of the downloaded source archive. When set,
+    /// the archive is verified after download and before extraction.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 fn default_arch() -> String {
@@ -150,8 +345,12 @@ pub struct Manifest {
     pub packages: Vec<Package>,
 }
 
-pub fn fetch(src: &str, dir: &str) -> Result<()> {
-    let src_path = if let Some(stripped) = src.strip_prefix("file://") { stripped } else { src };
+pub fn fetch(src: &str, dir: &str, expected_sha256: Option<&str>) -> Result<()> {
+    let src_path = if let Some(stripped) = src.strip_prefix("file://") {
+        stripped
+    } else {
+        src
+    };
 
     let src_path_obj = Path::new(src_path);
     if src_path_obj.exists() {
@@ -175,6 +374,16 @@ pub fn fetch(src: &str, dir: &str) -> Result<()> {
                         fs::create_dir_all(parent)?;
                     }
                     fs::copy(&path, &dest)?;
+                    // fs::copy preserves the source mode bits; strip
+                    // setuid/setgid/sticky so staged trees can't smuggle in
+                    // privileged files.
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&dest)?.permissions();
+                    let mode = perms.mode();
+                    if mode & 0o7000 != 0 {
+                        perms.set_mode(mode & 0o777);
+                        fs::set_permissions(&dest, perms)?;
+                    }
                 }
             }
             Ok(())
@@ -183,13 +392,23 @@ pub fn fetch(src: &str, dir: &str) -> Result<()> {
         let dst = Path::new(dir);
         if src_path_obj.is_dir() {
             UserInterface::info("Copying local source directory...");
-            copy_dir_recursive(src_path_obj, dst).context("Failed to copy local source directory")?;
+            copy_dir_recursive(src_path_obj, dst)
+                .context("Failed to copy local source directory")?;
         } else {
             UserInterface::info("Copying local source file...");
             fs::create_dir_all(dst)?;
-            let file_name = src_path_obj.file_name().ok_or_else(|| anyhow!("Invalid source file name"))?;
+            let file_name = src_path_obj
+                .file_name()
+                .ok_or_else(|| anyhow!("Invalid source file name"))?;
             let dest_file = dst.join(file_name);
-            fs::copy(src_path_obj, dest_file).context("Failed to copy local source file")?;
+            fs::copy(src_path_obj, &dest_file).context("Failed to copy local source file")?;
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dest_file)?.permissions();
+            let mode = perms.mode();
+            if mode & 0o7000 != 0 {
+                perms.set_mode(mode & 0o777);
+                fs::set_permissions(&dest_file, perms)?;
+            }
         }
         return Ok(());
     }
@@ -212,7 +431,7 @@ pub fn fetch(src: &str, dir: &str) -> Result<()> {
     } else {
         "temp_archive.tar.gz"
     };
-    
+
     let archive_path = Path::new(dir).join(archive_name);
     let archive_str = archive_path.to_string_lossy();
 
@@ -225,6 +444,24 @@ pub fn fetch(src: &str, dir: &str) -> Result<()> {
         return Err(anyhow!("Curl failed to download: {}", src));
     }
 
+    if let Some(expected) = expected_sha256 {
+        let actual = hash_file(&archive_path)?
+            .into_iter()
+            .find(|c| c.kind == "sha256")
+            .map(|c| c.value)
+            .ok_or_else(|| anyhow!("SHA-256 unavailable for downloaded archive"))?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            let _ = fs::remove_file(&archive_path);
+            return Err(anyhow!(
+                "SHA-256 mismatch for downloaded source '{}': expected {}, got {}",
+                src,
+                expected,
+                actual
+            ));
+        }
+        UserInterface::info("Downloaded archive SHA-256 verified OK");
+    }
+
     let tar_flag = if src.ends_with(".xz") {
         "-xJf"
     } else if src.ends_with(".bz2") {
@@ -234,79 +471,162 @@ pub fn fetch(src: &str, dir: &str) -> Result<()> {
     };
 
     UserInterface::info("Extracting source archive...");
-    let tar_status = Command::new("tar")
-        .args([tar_flag, &archive_str, "-C", dir, "--strip-components=1"])
-        .status()?;
-
+    let tar_out = Command::new("tar")
+        .args([
+            tar_flag,
+            &archive_str,
+            "-C",
+            dir,
+            "--strip-components=1",
+            "--no-same-owner",
+            "--no-same-permissions",
+        ])
+        .output()?;
     let _ = std::fs::remove_file(&archive_path);
 
-    if !tar_status.success() {
-        return Err(anyhow!("Tar failed to decompress archive"));
+    if !tar_out.status.success() {
+        return Err(anyhow!(
+            "Tar failed to decompress archive: {}",
+            String::from_utf8_lossy(&tar_out.stderr).trim()
+        ));
     }
-    
+
     Ok(())
 }
 
 pub fn build(pkg: &Package, dir: &str) -> Result<String> {
-    let bcmd = pkg.build_cmd.trim();
-    if bcmd.eq_ignore_ascii_case("none") || bcmd.eq_ignore_ascii_case("skip") || bcmd.eq_ignore_ascii_case("nothing") {
-        UserInterface::warning("Skipping build step as requested");
-        return Ok(String::new());
-    }
-
-    if bcmd.is_empty() {
+    if pkg.build.is_empty() {
         if std::env::var("OUS_NO_AUTO").is_ok() {
             return Ok(String::new());
         }
 
         if pkg.build_type == "rust" {
-            let target = env::var("OUS_TARGET").unwrap_or_else(|_| "x86_64-unknown-linux-musl".to_string());
-            let cpu = if target.contains("aarch64") { "armv8-a" } else { "x86-64-v3" };
+            let target = env::var("OUS_TARGET")
+                .unwrap_or_else(|_| crate::config::schema::default_target_arch());
+            let cpu = if target.contains("aarch64") {
+                "armv8-a"
+            } else {
+                "x86-64-v3"
+            };
             UserInterface::info(&format!("Running automatic cargo build for {target}..."));
             let flags = format!(
                 "-C linker=clang -C target-cpu={cpu} -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+crt-static -C link-arg=-target -C link-arg={target} -C link-arg=-march={cpu} -C link-arg=-O3 -C link-arg=-flto=full -C link-arg=--sysroot=/system"
             );
-            let cmd = format!(
-                "RUSTFLAGS={} cargo build --release --target {} 2>&1 | tee capture.log",
-                sh_quote(&flags), sh_quote(&target)
-            );
-            let out = Command::new("sh")
-                .args(["-c", &cmd])
+            // Run cargo directly (no shell pipeline) so its real exit status is
+            // observed; capture stdout+stderr ourselves into capture.log.
+            let out = Command::new("cargo")
+                .env("RUSTFLAGS", &flags)
+                .args(["build", "--release", "--target", &target])
                 .current_dir(dir)
-                .output()?;
-            let log_content = String::from_utf8_lossy(&out.stdout).to_string();
-            if out.status.success() {
-                return Ok(log_content);
-            } else {
-                return Err(anyhow!("Rust auto-build failed: {}", log_content));
+                .output()
+                .context("Failed to spawn cargo for automatic Rust build")?;
+            let mut log_content = String::from_utf8_lossy(&out.stdout).to_string();
+            log_content.push_str(&String::from_utf8_lossy(&out.stderr));
+            let log_path = Path::new(dir).join("capture.log");
+            fs::write(&log_path, &log_content)?;
+            if UserInterface::debug_enabled() {
+                UserInterface::info(&format!("cargo output:\n{}", log_content.trim_end()));
             }
+            if !out.status.success() {
+                return Err(anyhow!(
+                    "Rust auto-build failed with {}: {}",
+                    out.status,
+                    log_content.trim_end()
+                ));
+            }
+            return Ok(log_content);
         } else {
             return Ok(String::new());
         }
     }
 
-    UserInterface::info("Executing custom build command...");
-    let log_file = "capture.log";
-    let cmd_with_capture = format!("({}) 2>&1 | tee {}", pkg.build_cmd, log_file);
+    let mut full_log = String::new();
 
-    let status = Command::new("sh")
-        .args(["-c", &cmd_with_capture])
-        .current_dir(dir)
-        .status()?;
+    for (i, cmd) in pkg.build.iter().enumerate() {
+        let trimmed = cmd.trim();
+        if trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("skip")
+            || trimmed.eq_ignore_ascii_case("nothing")
+        {
+            UserInterface::warning(&format!("Skipping build command {} as requested", i + 1));
+            continue;
+        }
 
-    let log_path = Path::new(dir).join(log_file);
-    let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&log_path);
+        UserInterface::info(&format!(
+            "Executing build command {}/{}...",
+            i + 1,
+            pkg.build.len()
+        ));
+        // Run via sh but without a pipeline: sh reports THIS command's exit
+        // status directly and we write the combined capture.log ourselves.
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(trimmed)
+            .current_dir(dir)
+            .output()
+            .with_context(|| format!("Failed to spawn shell for build command {}", i + 1))?;
+        let mut combined = String::from_utf8_lossy(&out.stdout).to_string();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
 
-    if status.success() { Ok(log_content) } else { Err(anyhow!("Build command failed")) }
+        let log_path = Path::new(dir).join("capture.log");
+        fs::write(&log_path, &combined)?;
+        if UserInterface::debug_enabled() {
+            UserInterface::info(&format!(
+                "build command {} output:\n{}",
+                i + 1,
+                combined.trim_end()
+            ));
+        }
+
+        if !out.status.success() {
+            return Err(anyhow!(
+                "Build command {} failed with {}: {}",
+                i + 1,
+                out.status,
+                combined.trim_end()
+            ));
+        }
+        let _ = fs::remove_file(&log_path);
+        full_log.push_str(&combined);
+    }
+
+    Ok(full_log)
 }
 
 pub fn symlink(target: &str, link_path: &str, root_dir: &str) -> Result<()> {
     let safe_link_path = link_path.trim_start_matches('/');
-    let full_link_path = format!("{}/{}", root_dir, safe_link_path);
-    
-    if let Some(parent) = Path::new(&full_link_path).parent() {
+    if safe_link_path.is_empty() || safe_link_path.ends_with('/') {
+        return Err(anyhow!("Invalid symlink link path '{}'", link_path));
+    }
+    let root = Path::new(root_dir);
+    let full_link_path = root.join(safe_link_path);
+
+    // Lexical check: no ".." components may remain after stripping the
+    // leading '/' — otherwise the link would be created outside the staging
+    // root. (A RootDir component merely reflects that `root_dir` is absolute.)
+    use std::path::Component;
+    if full_link_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(anyhow!(
+            "Refusing symlink link path '{}': it escapes the staging root",
+            link_path
+        ));
+    }
+
+    if let Some(parent) = full_link_path.parent() {
         fs::create_dir_all(parent)?;
+        // Canonical check: resolve any intermediate symlinks and make sure the
+        // parent really lives inside the staging root.
+        let canon_root = fs::canonicalize(root)?;
+        let canon_parent = fs::canonicalize(parent)?;
+        if !canon_parent.starts_with(&canon_root) {
+            return Err(anyhow!(
+                "Refusing symlink link path '{}': resolves outside the staging root",
+                link_path
+            ));
+        }
     }
     let _ = fs::remove_file(&full_link_path);
     std::os::unix::fs::symlink(target, &full_link_path)?;
@@ -314,18 +634,7 @@ pub fn symlink(target: &str, link_path: &str, root_dir: &str) -> Result<()> {
 }
 
 pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
-    let icmd = pkg.install_cmd.trim();
-    if icmd.eq_ignore_ascii_case("none") || icmd.eq_ignore_ascii_case("skip") || icmd.eq_ignore_ascii_case("nothing") {
-        UserInterface::warning("Skipping install step as requested");
-        if let Some(links) = &pkg.links {
-            for l in links {
-                symlink(l.0, l.1, dest)?;
-            }
-        }
-        return Ok(());
-    }
-
-    if icmd.is_empty() {
+    if pkg.install.is_empty() {
         if std::env::var("OUS_NO_AUTO").is_ok() {
             if let Some(links) = &pkg.links {
                 for l in links {
@@ -344,11 +653,12 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_file()
-                            && let Some(fname) = path.file_name() {
-                                let dest_file = Path::new(dest).join(fname);
-                                let _ = fs::remove_file(&dest_file);
-                                fs::copy(&path, &dest_file)?;
-                            }
+                            && let Some(fname) = path.file_name()
+                        {
+                            let dest_file = Path::new(dest).join(fname);
+                            let _ = fs::remove_file(&dest_file);
+                            fs::copy(&path, &dest_file)?;
+                        }
                     }
                 }
             }
@@ -369,14 +679,31 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
         return Ok(());
     }
 
-    UserInterface::info("Executing custom install command...");
-    let status = Command::new("sh")
-        .env("CUDANE_DEST", dest)
-        .args(["-c", &pkg.install_cmd])
-        .current_dir(src)
-        .status()?;
+    for (i, cmd) in pkg.install.iter().enumerate() {
+        let trimmed = cmd.trim();
+        if trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("skip")
+            || trimmed.eq_ignore_ascii_case("nothing")
+        {
+            UserInterface::warning(&format!("Skipping install command {} as requested", i + 1));
+            continue;
+        }
 
-    if !status.success() { return Err(anyhow!("Install command failed")); }
+        UserInterface::info(&format!(
+            "Executing install command {}/{}...",
+            i + 1,
+            pkg.install.len()
+        ));
+        let status = Command::new("sh")
+            .env("CUDANE_DEST", dest)
+            .args(["-c", trimmed])
+            .current_dir(src)
+            .status()?;
+
+        if !status.success() {
+            return Err(anyhow!("Install command {} failed", i + 1));
+        }
+    }
 
     if let Some(links) = &pkg.links {
         for l in links {
@@ -387,7 +714,9 @@ pub fn install(pkg: &Package, src: &str, dest: &str) -> Result<()> {
 }
 
 pub fn hash(dir: &str) -> Result<Vec<Checksum>> {
-    let output = Command::new("tar").args(["-cf", "-", "-C", dir, "."]).output()?;
+    let output = Command::new("tar")
+        .args(["-cf", "-", "-C", dir, "."])
+        .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "tar failed while hashing directory '{}': {}",
@@ -412,6 +741,42 @@ pub fn hash(dir: &str) -> Result<Vec<Checksum>> {
         Checksum {
             kind: "md5".to_string(),
             value: md5.iter().map(|b| format!("{:02x}", b)).collect(),
+        },
+    ])
+}
+
+/// Hash a single file's raw bytes (used for inspecting packaged archives).
+pub fn hash_file(path: &Path) -> Result<Vec<Checksum>> {
+    let mut file = fs::File::open(path)?;
+
+    let mut sha256 = Sha256::new();
+    let mut sha1 = Sha1::new();
+    let mut md5 = Md5::new();
+
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha256.update(&buf[..n]);
+        sha1.update(&buf[..n]);
+        md5.update(&buf[..n]);
+    }
+
+    let to_hex = |digest: &[u8]| digest.iter().map(|b| format!("{:02x}", b)).collect();
+    Ok(vec![
+        Checksum {
+            kind: "sha256".to_string(),
+            value: to_hex(&sha256.finalize()),
+        },
+        Checksum {
+            kind: "sha1".to_string(),
+            value: to_hex(&sha1.finalize()),
+        },
+        Checksum {
+            kind: "md5".to_string(),
+            value: to_hex(&md5.finalize()),
         },
     ])
 }
@@ -445,9 +810,10 @@ fn provides(dir: &str) -> Result<Vec<String>> {
                 if path.is_dir() {
                     paths.push(path);
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && (name.ends_with(".so") || name.contains(".so.")) {
-                        provides.push(name.to_string());
-                    }
+                    && (name.ends_with(".so") || name.contains(".so."))
+                {
+                    provides.push(name.to_string());
+                }
             }
         }
     }
@@ -457,64 +823,111 @@ fn provides(dir: &str) -> Result<Vec<String>> {
 }
 
 fn license(src_dir: &str) -> String {
-    let license_files = ["LICENSE", "COPYING", "LICENSE.MD", "COPYING.MD", "MIT-LICENSE", "UNLICENSE"];
+    let license_files = [
+        "LICENSE",
+        "COPYING",
+        "LICENSE.MD",
+        "COPYING.MD",
+        "MIT-LICENSE",
+        "UNLICENSE",
+    ];
     let license_regex = Regex::new(
         r"(?i)\b(gnu\s+general\s+public\s+license|gpl|lgpl|agpl|apache|mit|bsd|mpl|mozilla\s+public\s+license|unlicense|isc)\b\s*(v(?:ersion)?\s*\d+(?:\.\d+)?|\d+[-—]clause|\d+(?:\.\d+)?\b)?"
     ).expect("valid license regex");
 
     if let Ok(entries) = fs::read_dir(src_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_uppercase();
-            
-            if license_files.iter().any(|&f| name.contains(f))
-                && let Ok(content) = fs::read_to_string(entry.path()) {
-                    for cap in license_regex.captures_iter(&content) {
-                        let license_name = cap.get(1).map_or("", |m| m.as_str().trim());
-                        let mut formatted_name = if license_name.len() <= 4 {
-                            license_name.to_uppercase()
-                        } else {
-                            license_name.split_whitespace()
-                                .map(|w| {
-                                    let mut chars = w.chars();
-                                    match chars.next() {
-                                        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-                                        None => String::new(),
-                                    }
-                                })
-                                .collect::<Vec<String>>()
-                                .join(" ")
-                        };
+        // Sort entries so the scan is deterministic regardless of
+        // filesystem readdir order.
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_uppercase())
+                .unwrap_or_default();
 
-                        if let Some(version) = cap.get(2) {
-                            let ver_str = version.as_str().trim();
-                            if ver_str.to_lowercase().starts_with("v") {
-                                let clean_ver = ver_str.trim_start_matches(|c: char| c.is_alphabetic()).trim();
-                                formatted_name = format!("{} v{}", formatted_name, clean_ver);
-                            } else {
-                                formatted_name = format!("{} {}", formatted_name, ver_str);
-                            }
-                        }
-                        
-                        if !formatted_name.is_empty() {
-                            return formatted_name;
+            if license_files.iter().any(|&f| name.contains(f))
+                && let Ok(content) = fs::read_to_string(&path)
+            {
+                for cap in license_regex.captures_iter(&content) {
+                    let license_name = cap.get(1).map_or("", |m| m.as_str().trim());
+                    let mut formatted_name = if license_name.len() <= 4 {
+                        license_name.to_uppercase()
+                    } else {
+                        license_name
+                            .split_whitespace()
+                            .map(|w| {
+                                let mut chars = w.chars();
+                                match chars.next() {
+                                    Some(first) => {
+                                        format!("{}{}", first.to_uppercase(), chars.as_str())
+                                    }
+                                    None => String::new(),
+                                }
+                            })
+                            .collect::<Vec<String>>()
+                            .join(" ")
+                    };
+
+                    if let Some(version) = cap.get(2) {
+                        let ver_str = version.as_str().trim();
+                        if ver_str.to_lowercase().starts_with("v") {
+                            let clean_ver = ver_str
+                                .trim_start_matches(|c: char| c.is_alphabetic())
+                                .trim();
+                            formatted_name = format!("{} v{}", formatted_name, clean_ver);
+                        } else {
+                            formatted_name = format!("{} {}", formatted_name, ver_str);
                         }
                     }
 
-                    if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
-                        let cleaned = first_line.trim().trim_matches(|c| c == '*' || c == '#' || c == '/').trim();
-                        if !cleaned.is_empty() && cleaned.len() < 60 {
-                            return cleaned.to_string();
-                        }
+                    if !formatted_name.is_empty() {
+                        return formatted_name;
                     }
                 }
+
+                if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
+                    let cleaned = first_line
+                        .trim()
+                        .trim_matches(|c| c == '*' || c == '#' || c == '/')
+                        .trim();
+                    if !cleaned.is_empty() && cleaned.len() < 60 {
+                        return cleaned.to_string();
+                    }
+                }
+            }
         }
     }
     "Unknown".into()
 }
 
-pub fn scan(dest_dir: &str, src_dir: &str, log_content: &str, current_pkg: &Package, repo_root: &Path) -> Result<Vec<Dependency>> {
+pub fn scan(
+    dest_dir: &str,
+    src_dir: &str,
+    log_content: &str,
+    current_pkg: &Package,
+    repo_root: &Path,
+) -> Result<Vec<Dependency>> {
     let mut deps_map: HashMap<String, HashSet<String>> = HashMap::new();
     let mut pkg_libs: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Manifest-declared dependencies are authoritative — seed them first so
+    // auto-discovery only adds extra types to the same package entry.
+    if let Some(declared) = &current_pkg.dependencies {
+        for dep in declared {
+            let name = match dep {
+                DependencyEntry::Simple(n) => n.clone(),
+                DependencyEntry::Versioned { name, .. } => name.clone(),
+            };
+            if name.eq_ignore_ascii_case(&current_pkg.name) {
+                continue;
+            }
+            deps_map
+                .entry(name)
+                .or_default()
+                .insert("Manifest".to_string());
+        }
+    }
 
     for (name, dep_type) in crate::deps::scan_source_deps(src_dir) {
         if name.eq_ignore_ascii_case(&current_pkg.name) {
@@ -532,6 +945,8 @@ pub fn scan(dest_dir: &str, src_dir: &str, log_content: &str, current_pkg: &Pack
 
     let library_names = crate::deps::libdeps(dest_dir)?;
     let library_packages = mltp(repo_root, &current_pkg.arch)?;
+    let strict = env::var("OUS_STRICT").is_ok();
+    let mut unresolved: Vec<String> = Vec::new();
 
     for lib in library_names {
         let normalized = normalize(&lib);
@@ -557,8 +972,19 @@ pub fn scan(dest_dir: &str, src_dir: &str, log_content: &str, current_pkg: &Pack
         }
 
         if !resolved {
-            deps_map.entry(lib).or_default().insert("Library".to_string());
+            unresolved.push(lib.clone());
+            deps_map
+                .entry(lib)
+                .or_default()
+                .insert("Library".to_string());
         }
+    }
+
+    if strict && !unresolved.is_empty() {
+        return Err(anyhow!(
+            "Strict mode: libraries could not be resolved to packages: {}",
+            unresolved.join(", ")
+        ));
     }
 
     let index_graph = loadex(repo_root, &current_pkg.arch)?;
@@ -604,29 +1030,37 @@ fn cdd(log_content: &str) -> Vec<(String, String)> {
     let mut results = Vec::new();
 
     let re = Regex::new(r"(?i)pkg-config[^\n]*--libs\s+([^\s]+)").expect("valid regex");
-    let dep_colon_re = Regex::new(r"(?i)(?:dependency|package)\b[^:\n]*:\s*([^\s]+)").expect("valid regex");
+    let dep_colon_re =
+        Regex::new(r"(?i)(?:dependency|package)\b[^:\n]*:\s*([^\s]+)").expect("valid regex");
     for line in log_content.lines() {
         let lower = line.to_lowercase();
         let mut extracted_name = String::new();
 
         if lower.contains("pkg-config") {
-            if let Some(caps) = re.captures(line)
-            {
+            if let Some(caps) = re.captures(line) {
                 extracted_name = caps[1].to_string();
             }
-        } else if (lower.contains("dependency") || lower.contains("package")) && lower.contains("found") {
+        } else if (lower.contains("dependency") || lower.contains("package"))
+            && lower.contains("found")
+        {
             if let Some(caps) = dep_colon_re.captures(line) {
                 extracted_name = caps[1].to_string();
             } else {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(idx) = parts.iter().position(|&r| r.eq_ignore_ascii_case("dependency")) {
+                if let Some(idx) = parts
+                    .iter()
+                    .position(|&r| r.eq_ignore_ascii_case("dependency"))
+                {
                     if idx + 1 < parts.len() {
                         extracted_name = parts[idx + 1].to_string();
                     }
-                } else if let Some(idx) = parts.iter().position(|&r| r.eq_ignore_ascii_case("package"))
-                    && idx + 1 < parts.len() {
-                        extracted_name = parts[idx + 1].to_string();
-                    }
+                } else if let Some(idx) = parts
+                    .iter()
+                    .position(|&r| r.eq_ignore_ascii_case("package"))
+                    && idx + 1 < parts.len()
+                {
+                    extracted_name = parts[idx + 1].to_string();
+                }
             }
         } else if lower.starts_with("found ") || lower.starts_with("checking for ") {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -636,11 +1070,40 @@ fn cdd(log_content: &str) -> Vec<(String, String)> {
         }
 
         let clean_name = extracted_name
-            .trim_matches(|c| c == '\'' || c == '"' || c == '`' || c == ':' || c == '.' || c == ',' || c == ';' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '/')
+            .trim_matches(|c| {
+                c == '\''
+                    || c == '"'
+                    || c == '`'
+                    || c == ':'
+                    || c == '.'
+                    || c == ','
+                    || c == ';'
+                    || c == '('
+                    || c == ')'
+                    || c == '['
+                    || c == ']'
+                    || c == '{'
+                    || c == '}'
+                    || c == '/'
+            })
             .trim()
             .to_string();
 
-        let ignore_list = ["threads", "for", "pkg-config", "cmake", "ninja", "yes", "no", "found", "not", "module", "function", "program", "library"];
+        let ignore_list = [
+            "threads",
+            "for",
+            "pkg-config",
+            "cmake",
+            "ninja",
+            "yes",
+            "no",
+            "found",
+            "not",
+            "module",
+            "function",
+            "program",
+            "library",
+        ];
         if !clean_name.is_empty() && !ignore_list.contains(&clean_name.to_lowercase().as_str()) {
             results.push((clean_name, "Build".to_string()));
         }
@@ -704,14 +1167,18 @@ fn mltp(repo_root: &Path, arch: &str) -> Result<HashMap<String, Vec<String>>> {
                         }
 
                         if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                            && (name.contains(".so") || name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".a")) {
-                                for variant in normalize(name) {
-                                    let pkg_list = library_packages.entry(variant).or_default();
-                                    if !pkg_list.contains(&package_name) {
-                                        pkg_list.push(package_name.clone());
-                                    }
+                            && (name.contains(".so")
+                                || name.ends_with(".dll")
+                                || name.ends_with(".dylib")
+                                || name.ends_with(".a"))
+                        {
+                            for variant in normalize(name) {
+                                let pkg_list = library_packages.entry(variant).or_default();
+                                if !pkg_list.contains(&package_name) {
+                                    pkg_list.push(package_name.clone());
                                 }
                             }
+                        }
                     }
                 }
             }
@@ -777,13 +1244,33 @@ fn transitive(
     }
 }
 
-pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_content: &str, repo_root: &Path) -> Result<PackageMetadata> {
+pub fn mtd(
+    pkg: &Package,
+    dest: &str,
+    sum: &[Checksum],
+    src_dir: &str,
+    log_content: &str,
+    repo_root: &Path,
+) -> Result<PackageMetadata> {
     let dependencies = scan(dest, src_dir, log_content, pkg, repo_root)?;
     let pkg_files = files(dest)?;
     let provides = provides(dest)?;
 
-    let target_type = env::var("OUS_HASH_TYPE").unwrap_or_else(|_| "sha256".to_string());
-    
+    let target_type = match env::var("OUS_HASH_TYPE") {
+        Ok(raw) => {
+            let lowered = raw.to_lowercase();
+            if matches!(lowered.as_str(), "sha256" | "sha1" | "md5") {
+                lowered
+            } else {
+                return Err(anyhow!(
+                    "Invalid hash type '{}': supported algorithms are sha256, sha1, md5",
+                    raw
+                ));
+            }
+        }
+        Err(_) => "sha256".to_string(),
+    };
+
     let selected = if let Some(c) = sum.iter().find(|c| c.kind == target_type) {
         c.clone()
     } else if let Some(first) = sum.first() {
@@ -821,8 +1308,8 @@ pub fn mtd(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_conte
         checksum: selected,
         dependencies,
         files: pkg_files.into_iter().map(PathBuf::from).collect(),
-        provides: Some(provides), 
-        conflicts: None::<Vec<String>>, 
+        provides: Some(provides),
+        conflicts: None::<Vec<String>>,
         components,
         services,
         binaries,
@@ -848,11 +1335,28 @@ pub fn assign_components(pkg_files: &[String], pkg: &Package) -> Vec<Component> 
 
     for spec in &specs {
         let mut matched = Vec::new();
-        for pattern in &spec.files {
+        for raw_pattern in &spec.files {
+            // Trailing slashes would never match the stored relative paths.
+            let pattern = raw_pattern.trim_end_matches('/');
+            if pattern.is_empty() {
+                UserInterface::error(&format!(
+                    "Component '{}': empty file pattern is not allowed",
+                    spec.name
+                ));
+                continue;
+            }
             for file in pkg_files {
+                // First matching spec wins: files already claimed by an
+                // earlier component are skipped here.
+                if !unassigned_files.contains(file) {
+                    continue;
+                }
                 let boundary_match = file.starts_with(pattern)
                     && file.is_char_boundary(pattern.len())
-                    && file[pattern.len()..].chars().next().is_none_or(|c| c == '/');
+                    && file[pattern.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c == '/');
                 if file == pattern || boundary_match {
                     matched.push(PathBuf::from(file));
                     unassigned_files.remove(file);
@@ -873,45 +1377,58 @@ pub fn assign_components(pkg_files: &[String], pkg: &Package) -> Vec<Component> 
 
         if !specs.iter().any(|s| s.name == "core") {
             UserInterface::warning(&format!(
-                "{} files not matched by any component; adding to 'core'", entry.len()
+                "{} files not matched by any component; adding to 'core'",
+                entry.len()
             ));
         }
     }
 
-    let mut components: Vec<Component> = specs.iter().map(|spec| {
-        let files = assigned.get(&spec.name).cloned().unwrap_or_default();
-        Component {
-            name: spec.name.clone(),
-            priority: spec.priority.clone(),
-            files,
-            dependencies: Vec::new(),
-            description: spec.description.clone(),
-        }
-    }).collect();
+    let mut components: Vec<Component> = specs
+        .iter()
+        .map(|spec| {
+            let files = assigned.get(&spec.name).cloned().unwrap_or_default();
+            Component {
+                name: spec.name.clone(),
+                priority: spec.priority.clone(),
+                files,
+                dependencies: Vec::new(),
+                description: spec.description.clone(),
+            }
+        })
+        .collect();
 
     if let Some(core_files) = assigned.get("core")
         && !core_files.is_empty()
-        && !specs.iter().any(|s| s.name == "core") {
-            components.push(Component {
-                name: "core".to_string(),
-                priority: "required".to_string(),
-                files: core_files.clone(),
-                dependencies: Vec::new(),
-                description: format!("Core files for {}", pkg.name),
-            });
-        }
+        && !specs.iter().any(|s| s.name == "core")
+    {
+        components.push(Component {
+            name: "core".to_string(),
+            priority: "required".to_string(),
+            files: core_files.clone(),
+            dependencies: Vec::new(),
+            description: format!("Core files for {}", pkg.name),
+        });
+    }
 
     let has_required = components.iter().any(|c| c.priority == "required");
-    if !has_required && !components.is_empty()
-        && let Some(first) = components.first_mut() {
-            first.priority = "required".to_string();
-        }
+    if !has_required
+        && !components.is_empty()
+        && let Some(first) = components.first_mut()
+    {
+        first.priority = "required".to_string();
+    }
 
     components.sort_by(|a, b| a.name.cmp(&b.name));
     components
 }
 
-pub fn meta(pkg: &Package, dest: &str, sum: &[Checksum], src_dir: &str, log_content: &str) -> Result<()> {
+pub fn meta(
+    pkg: &Package,
+    dest: &str,
+    sum: &[Checksum],
+    src_dir: &str,
+    log_content: &str,
+) -> Result<()> {
     let repo_root = env::current_dir()?;
     let meta = mtd(pkg, dest, sum, src_dir, log_content, &repo_root)?;
     write(&meta, dest)
@@ -921,7 +1438,7 @@ pub fn write(meta: &PackageMetadata, dest: &str) -> Result<()> {
     fs::create_dir_all(dest)?;
     let path = format!("{}/metadata.json", dest);
     let json = serde_json::to_string_pretty(meta)?;
-    fs::write(path, json)?;
+    atomic_write(Path::new(&path), json.as_bytes())?;
     Ok(())
 }
 
@@ -942,7 +1459,10 @@ pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
         Vec::new()
     };
 
-    if let Some(existing_meta) = entries.iter_mut().find(|entry| entry.pkg_name == meta.pkg_name && entry.version == meta.version) {
+    if let Some(existing_meta) = entries
+        .iter_mut()
+        .find(|entry| entry.pkg_name == meta.pkg_name && entry.version == meta.version)
+    {
         if *existing_meta == *meta {
             return Ok(());
         }
@@ -951,29 +1471,89 @@ pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
         entries.push(meta.clone());
     }
 
-    entries.sort_by_key(|a| (a.pkg_name.clone(), a.version.clone()));
+    // Sort by name, then by version using a natural-aware key so numeric
+    // runs compare numerically (1.10 sorts after 1.9).
+    entries.sort_by(|a, b| {
+        a.pkg_name
+            .cmp(&b.pkg_name)
+            .then_with(|| version_sort_key(&a.version).cmp(&version_sort_key(&b.version)))
+    });
     let json = serde_json::to_string_pretty(&entries)?;
-    fs::write(index_path, json)?;
-    
+    atomic_write(&index_path, json.as_bytes())?;
+
     Ok(())
 }
 
 pub fn archive(dest: &str, out: &str) -> Result<()> {
-    let level = env::var("OUS_ZSTD_LEVEL").unwrap_or_else(|_| "3".to_string());
-    let mut tar_cmd = Command::new("tar");
-    tar_cmd.args(["-c", "-C", dest, "."]);
-    let mut tar_child = tar_cmd.stdout(std::process::Stdio::piped()).spawn()?;
-    let mut zstd_child = Command::new("zstd")
-        .arg(format!("-{}", level))
-        .stdin(std::process::Stdio::from(tar_child.stdout.take().expect("tar stdout")))
-        .stdout(std::process::Stdio::from(fs::File::create(out)?))
+    let level = zstd_level_from_env();
+    let out_path = Path::new(out);
+    let dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir)?;
+    let file_name = out_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "package.xcs".to_string());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp_path = dir.join(format!(
+        ".{}.tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        nanos
+    ));
+
+    // tar | zstd pipeline writing into a temporary sibling; only a fully
+    // successful run is renamed over the final output path.
+    let mut tar_child = Command::new("tar")
+        .args(["-c", "-C", dest, "."])
+        .stdout(std::process::Stdio::piped())
         .spawn()?;
+    let tar_stdin = tar_child.stdout.take();
+
+    let zstd_child = match tar_stdin {
+        Some(stdin) => fs::File::create(&tmp_path).and_then(|file| {
+            Command::new("zstd")
+                .arg(format!("-{}", level))
+                .stdin(std::process::Stdio::from(stdin))
+                .stdout(std::process::Stdio::from(file))
+                .spawn()
+        }),
+        None => Err(std::io::Error::other("tar stdout unavailable")),
+    };
+
+    let mut zstd_child = match zstd_child {
+        Ok(child) => child,
+        Err(e) => {
+            // Never leak/zombify the tar child when the downstream half of
+            // the pipeline fails to start.
+            let _ = tar_child.kill();
+            let _ = tar_child.wait();
+            return Err(anyhow!(e).context("Failed to start zstd for archive compression"));
+        }
+    };
+
     let tar_status = tar_child.wait()?;
-    let zstd_status = zstd_child.wait()?;
-    if tar_status.success() && zstd_status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("Archive compression failed"))
+    let zstd_result = zstd_child.wait();
+
+    match (tar_status.success(), zstd_result) {
+        (true, Ok(zstd_status)) if zstd_status.success() => {
+            fs::rename(&tmp_path, out_path)?;
+            Ok(())
+        }
+        (_, zstd_status) => {
+            let detail = match zstd_status {
+                Ok(s) => format!("zstd exited with {}", s),
+                Err(e) => format!("zstd wait failed: {}", e),
+            };
+            let _ = fs::remove_file(&tmp_path);
+            Err(anyhow!(
+                "Archive compression failed (tar: {}, {})",
+                if tar_status.success() { "ok" } else { "failed" },
+                detail
+            ))
+        }
     }
 }
 
@@ -984,20 +1564,24 @@ struct BuildProgress {
 
 fn save_state(path: &Path, state: &BuildProgress) -> Result<()> {
     let json = serde_json::to_string_pretty(state)?;
-    fs::write(path, json)?;
+    atomic_write(path, json.as_bytes())?;
     Ok(())
 }
 
 fn validate_path_component(value: &str, label: &str) -> Result<()> {
-    let safe = value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let safe = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if value.is_empty()
         || value.contains('/')
         || value.contains("..")
         || value.starts_with('.')
-        || !safe {
+        || !safe
+    {
         return Err(anyhow!(
             "Invalid {} '{}': only letters, digits, '-', '_' and '.' are allowed; '/', '..' and a leading '.' are forbidden",
-            label, value
+            label,
+            value
         ));
     }
     Ok(())
@@ -1006,15 +1590,32 @@ fn validate_path_component(value: &str, label: &str) -> Result<()> {
 pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     validate_path_component(&pkg.name, "package name")?;
     validate_path_component(&pkg.arch, "package arch")?;
-    UserInterface::info(&format!("Processing package: {} v{}", pkg.name, pkg.version));
+    validate_version_component(&pkg.version, "package version")?;
+    UserInterface::info(&format!(
+        "Processing package: {} v{}",
+        pkg.name, pkg.version
+    ));
     let current_dir = env::current_dir()?;
 
     let absolute_out_dir = current_dir.join(out_dir);
     fs::create_dir_all(&absolute_out_dir)?;
 
-    let final_path = format!("{}/{}-{}.xcs", absolute_out_dir.display(), pkg.name, pkg.version);
-    if Path::new(&final_path).exists() && env::var("OUS_FORCE").is_err() {
-        UserInterface::success(&format!("Package archive already exists at: {}", final_path));
+    let final_path = format!(
+        "{}/{}-{}.xcs",
+        absolute_out_dir.display(),
+        pkg.name,
+        pkg.version
+    );
+    // Short-circuit only when neither --force nor --clean was requested:
+    // --force must rebuild the archive, --clean starts from a fresh workspace.
+    if Path::new(&final_path).exists()
+        && env::var("OUS_FORCE").is_err()
+        && env::var("OUS_CLEAN").is_err()
+    {
+        UserInterface::success(&format!(
+            "Package archive already exists at: {}",
+            final_path
+        ));
         return Ok(final_path);
     }
 
@@ -1023,7 +1624,20 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     } else {
         format!("{}/{}", pkg.name, pkg.arch)
     };
-    let work_dir = current_dir.join(format!(".ous/{}", arch_dir));
+    // OUS_PROJECT_WORKSPACE relocates the build workspace root (chroot-style
+    // base for workspaces); defaults to the current directory.
+    let workspace_root = match env::var("OUS_PROJECT_WORKSPACE") {
+        Ok(dir) if !dir.trim().is_empty() => {
+            let p = PathBuf::from(dir);
+            if p.is_absolute() {
+                p
+            } else {
+                current_dir.join(p)
+            }
+        }
+        _ => current_dir.clone(),
+    };
+    let work_dir = workspace_root.join(format!(".ous/{}", arch_dir));
     let src_dir = work_dir.join("src");
     let pkg_root = work_dir.join("pkg");
     let state_path = work_dir.join(".state.json");
@@ -1032,6 +1646,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
 
     let mut state = BuildProgress::default();
     let clean = env::var("OUS_CLEAN").is_ok();
+    let force = env::var("OUS_FORCE").is_ok();
 
     if clean || !state_path.exists() {
         let _ = fs::remove_dir_all(&work_dir);
@@ -1039,94 +1654,215 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         fs::create_dir_all(&pkg_root)?;
     } else {
         if state_path.exists() {
-            state = serde_json::from_str(&fs::read_to_string(&state_path)?).unwrap_or_default();
+            match serde_json::from_str(&fs::read_to_string(&state_path)?) {
+                Ok(s) => state = s,
+                Err(e) => UserInterface::warning(&format!(
+                    "Could not parse {} ({}); resuming degraded to a cold build",
+                    state_path.display(),
+                    e
+                )),
+            }
         }
         fs::create_dir_all(&src_dir)?;
         fs::create_dir_all(&pkg_root)?;
     }
 
-    let src_str = src_dir.to_str().expect("valid UTF-8 path");
-    let root_str = pkg_root.to_str().expect("valid UTF-8 path");
+    // --force must produce a fresh archive: drop the tail steps from the
+    // resume markers so hash/metadata/archive re-run even when previously
+    // completed.
+    if force {
+        for step in ["archive", "hash", "metadata"] {
+            state.completed_steps.remove(step);
+        }
+    }
 
-    if !state.completed_steps.contains("fetch") {
+    let src_str = src_dir.to_string_lossy().to_string();
+    let root_str = pkg_root.to_string_lossy().to_string();
+
+    if !(state.completed_steps.contains("fetch") && dir_non_empty(&src_dir)) {
+        if state.completed_steps.contains("fetch") {
+            UserInterface::warning(
+                "Resume marker says fetch is done but src/ is empty — refetching",
+            );
+        }
         UserInterface::info("Fetching package source...");
-        fetch(&pkg.source, src_str).map_err(|e| {
+        fire_hook("pre-fetch", &pkg.name);
+        if let Err(e) = fetch(&pkg.source, &src_str, pkg.sha256.as_deref()) {
             UserInterface::error(&format!("Fetch step failed: {}", e));
-            anyhow!(e).context("Fetch step failed")
-        })?;
+            return Err(anyhow!(e).context("Fetch step failed"));
+        }
+        fire_hook("post-fetch", &pkg.name);
         state.completed_steps.insert("fetch".to_string());
         save_state(&state_path, &state)?;
     }
 
-    let build_log = if state.completed_steps.contains("build") {
-        fs::read_to_string(&build_log_path).unwrap_or_default()
+    let build_log = if state.completed_steps.contains("build") && build_log_path.is_file() {
+        match fs::read_to_string(&build_log_path) {
+            Ok(log) => log,
+            Err(e) => {
+                UserInterface::warning(&format!(
+                    "Could not read persisted build log ({}); rerunning build",
+                    e
+                ));
+                run_build_step(pkg, &src_str, &build_log_path, &mut state, &state_path)?
+            }
+        }
     } else {
-        UserInterface::info("Building package modules...");
-        let log = build(pkg, src_str).map_err(|e| {
-            UserInterface::error(&format!("Build step failed: {}", e));
-            anyhow!(e).context("Build step failed")
-        })?;
-        fs::write(&build_log_path, &log)?;
-        state.completed_steps.insert("build".to_string());
-        save_state(&state_path, &state)?;
-        log
+        if state.completed_steps.contains("build") {
+            UserInterface::warning(
+                "Resume marker says build is done but no build log found — rebuilding",
+            );
+        }
+        run_build_step(pkg, &src_str, &build_log_path, &mut state, &state_path)?
     };
 
-    if !state.completed_steps.contains("install") {
+    if !(state.completed_steps.contains("install") && dir_non_empty(&pkg_root)) {
+        if state.completed_steps.contains("install") {
+            UserInterface::warning(
+                "Resume marker says install is done but pkg/ is empty — reinstalling",
+            );
+        }
         UserInterface::info("Installing built files to root target...");
-        install(pkg, src_str, root_str).map_err(|e| {
+        fire_hook("pre-install", &pkg.name);
+        if let Err(e) = install(pkg, &src_str, &root_str) {
             UserInterface::error(&format!("Install step failed: {}", e));
-            anyhow!(e).context("Install step failed")
-        })?;
+            return Err(anyhow!(e).context("Install step failed"));
+        }
+        fire_hook("post-install", &pkg.name);
         state.completed_steps.insert("install".to_string());
         save_state(&state_path, &state)?;
     }
 
-    let sum: Vec<Checksum> = if state.completed_steps.contains("hash") {
-        serde_json::from_str(&fs::read_to_string(&sum_path)?).unwrap_or_else(|_| {
-            hash(root_str).unwrap_or_default()
-        })
+    let sum: Vec<Checksum> = if state.completed_steps.contains("hash") && sum_path.exists() {
+        match serde_json::from_str(&fs::read_to_string(&sum_path)?) {
+            Ok(s) => s,
+            Err(e) => {
+                UserInterface::warning(&format!(
+                    "Could not parse persisted checksums ({}); recomputing",
+                    e
+                ));
+                compute_hash_step(&root_str, &sum_path, &mut state, &state_path, &pkg.name)?
+            }
+        }
     } else {
-        UserInterface::info("Generating build checksum hash...");
-        let s = hash(root_str).map_err(|e| {
-            UserInterface::error(&format!("Hashing step failed: {}", e));
-            anyhow!(e).context("Hashing step failed")
-        })?;
-        fs::write(&sum_path, serde_json::to_string(&s)?)?;
-        state.completed_steps.insert("hash".to_string());
-        save_state(&state_path, &state)?;
-        s
+        if state.completed_steps.contains("hash") {
+            UserInterface::warning(
+                "Resume marker says hash is done but checksums.json is missing — recomputing",
+            );
+        }
+        compute_hash_step(&root_str, &sum_path, &mut state, &state_path, &pkg.name)?
     };
 
     if !state.completed_steps.contains("metadata") {
         UserInterface::info("Compiling dependency graph and manifest metadata...");
-        let metadata = mtd(pkg, root_str, &sum, src_str, &build_log, current_dir.as_path()).map_err(|e| {
-            UserInterface::error(&format!("Metadata generation failed: {}", e));
-            anyhow!(e).context("Metadata generation failed")
-        })?;
-        write(&metadata, root_str).map_err(|e| {
+        fire_hook("pre-metadata", &pkg.name);
+        let metadata = match mtd(
+            pkg,
+            &root_str,
+            &sum,
+            &src_str,
+            &build_log,
+            current_dir.as_path(),
+        ) {
+            Ok(meta) => meta,
+            Err(e) => {
+                UserInterface::error(&format!("Metadata generation failed: {}", e));
+                return Err(anyhow!(e).context("Metadata generation failed"));
+            }
+        };
+        if let Err(e) = write(&metadata, &root_str) {
             UserInterface::error(&format!("Writing metadata json failed: {}", e));
-            anyhow!(e).context("Metadata generation failed")
-        })?;
-        index(current_dir.to_str().expect("valid UTF-8 path"), &metadata).map_err(|e| {
+            return Err(anyhow!(e).context("Metadata generation failed"));
+        }
+        if let Err(e) = index(&current_dir.to_string_lossy(), &metadata) {
             UserInterface::error(&format!("Repository index append failed: {}", e));
-            anyhow!(e).context("Repository index generation failed")
-        })?;
+            return Err(anyhow!(e).context("Repository index generation failed"));
+        }
+        fire_hook("post-metadata", &pkg.name);
         state.completed_steps.insert("metadata".to_string());
         save_state(&state_path, &state)?;
     }
 
     if !state.completed_steps.contains("archive") {
         UserInterface::info("Compressing target root into final .xcs package...");
-        archive(root_str, &final_path).map_err(|e| {
+        fire_hook("pre-archive", &pkg.name);
+        if let Err(e) = archive(&root_str, &final_path) {
             UserInterface::error(&format!("Archiving compression failed: {}", e));
-            anyhow!(e).context("Archiving step failed")
-        })?;
+            return Err(anyhow!(e).context("Archiving step failed"));
+        }
+        // Write the integrity sidecar: hex SHA-256 of the FINAL compressed
+        // archive. `ous --inspect` verifies the .xcs against this digest.
+        match hash_file(Path::new(&final_path)) {
+            Ok(sums) => {
+                if let Some(sha) = sums.iter().find(|c| c.kind == "sha256") {
+                    let sidecar = format!("{}.sha256", final_path);
+                    if let Err(e) =
+                        atomic_write(Path::new(&sidecar), format!("{}\n", sha.value).as_bytes())
+                    {
+                        UserInterface::warning(&format!(
+                            "Could not write integrity sidecar {}: {}",
+                            sidecar, e
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                UserInterface::warning(&format!("Could not hash archive for sidecar: {}", e));
+            }
+        }
+        fire_hook("post-archive", &pkg.name);
         state.completed_steps.insert("archive".to_string());
         save_state(&state_path, &state)?;
     }
 
+    fire_hook("done", &pkg.name);
     Ok(final_path)
+}
+
+fn run_build_step(
+    pkg: &Package,
+    src_str: &str,
+    build_log_path: &Path,
+    state: &mut BuildProgress,
+    state_path: &Path,
+) -> Result<String> {
+    UserInterface::info("Building package modules...");
+    fire_hook("pre-build", &pkg.name);
+    let log = match build(pkg, src_str) {
+        Ok(log) => log,
+        Err(e) => {
+            UserInterface::error(&format!("Build step failed: {}", e));
+            return Err(anyhow!(e).context("Build step failed"));
+        }
+    };
+    atomic_write(build_log_path, log.as_bytes())?;
+    fire_hook("post-build", &pkg.name);
+    state.completed_steps.insert("build".to_string());
+    save_state(state_path, state)?;
+    Ok(log)
+}
+
+fn compute_hash_step(
+    root_str: &str,
+    sum_path: &Path,
+    state: &mut BuildProgress,
+    state_path: &Path,
+    pkg_name: &str,
+) -> Result<Vec<Checksum>> {
+    UserInterface::info("Generating build checksum hash...");
+    fire_hook("pre-hash", pkg_name);
+    let s = match hash(root_str) {
+        Ok(s) => s,
+        Err(e) => {
+            UserInterface::error(&format!("Hashing step failed: {}", e));
+            return Err(anyhow!(e).context("Hashing step failed"));
+        }
+    };
+    atomic_write(sum_path, serde_json::to_string(&s)?.as_bytes())?;
+    fire_hook("post-hash", pkg_name);
+    state.completed_steps.insert("hash".to_string());
+    save_state(state_path, state)?;
+    Ok(s)
 }
 
 pub fn sort_packages(dir: &str, arch: &str) -> Result<()> {
@@ -1134,27 +1870,57 @@ pub fn sort_packages(dir: &str, arch: &str) -> Result<()> {
     if !pool_dir.exists() {
         return Err(anyhow!("Directory '{}' not found", dir));
     }
-    let pattern = Regex::new(r"^(.*)-(\d[^-]*)\.xcs$")?;
+    let force = env::var("OUS_FORCE").is_ok();
     let mut moved = 0;
+    let mut skipped = 0;
     for entry in fs::read_dir(pool_dir)? {
         let entry = entry?;
         let fname = entry.file_name().to_string_lossy().into_owned();
         if !fname.ends_with(".xcs") || !entry.path().is_file() {
             continue;
         }
-        if let Some(caps) = pattern.captures(&fname) {
-            let pkg_name = &caps[1];
-            let target_dir = pool_dir.join(arch).join(pkg_name);
-            fs::create_dir_all(&target_dir)?;
-            let target = target_dir.join(&fname);
-            fs::rename(entry.path(), &target)?;
-            if env::var("OUS_QUIET").is_err() {
-                UserInterface::info(&format!("Moved: {} -> {}/{}", fname, arch, pkg_name));
+        let Some((pkg_name, _version)) = parse_xcs_name(&fname) else {
+            UserInterface::warning(&format!(
+                "Skipping '{}': filename does not match <name>-<version>.xcs",
+                fname
+            ));
+            skipped += 1;
+            continue;
+        };
+        let target_dir = pool_dir.join(arch).join(&pkg_name);
+        fs::create_dir_all(&target_dir)?;
+        let target = target_dir.join(&fname);
+        if target.exists() && !force {
+            // Destructive overwrite: require --force or an explicit yes.
+            let proceed = env::var("OUS_ASSUME_YES").is_ok()
+                || UserInterface::prompt_confirmation(&format!(
+                    "Overwrite existing {}?",
+                    target.display()
+                ));
+            if !proceed {
+                UserInterface::warning(&format!(
+                    "Skipped (exists): {} -> {}",
+                    fname,
+                    target.display()
+                ));
+                skipped += 1;
+                continue;
             }
-            moved += 1;
         }
+        fs::rename(entry.path(), &target)?;
+        if env::var("OUS_QUIET").is_err() {
+            UserInterface::info(&format!("Moved: {} -> {}/{}", fname, arch, pkg_name));
+        }
+        moved += 1;
     }
-    UserInterface::success(&format!("Sorted {} packages into {}/{}/", moved, dir, arch));
+    if skipped > 0 {
+        UserInterface::warning(&format!(
+            "Sorted {} packages into {}/{}/ ({} skipped)",
+            moved, dir, arch, skipped
+        ));
+    } else {
+        UserInterface::success(&format!("Sorted {} packages into {}/{}/", moved, dir, arch));
+    }
     Ok(())
 }
 
@@ -1164,13 +1930,20 @@ pub fn validate(index_path: &str, packages_dir: &str) -> Result<usize> {
     let mut index_entries: Vec<PackageMetadata> = Vec::new();
 
     if !index_file.exists() {
-        UserInterface::warning(&format!("{} not found — skipping index validation", index_path));
+        UserInterface::warning(&format!(
+            "{} not found — skipping index validation",
+            index_path
+        ));
     } else {
         let content = fs::read_to_string(index_file)?;
         match serde_json::from_str::<Vec<PackageMetadata>>(&content) {
             Ok(data) => {
                 index_entries = data;
-                UserInterface::success(&format!("{}: valid flat array ({} packages)", index_path, index_entries.len()));
+                UserInterface::success(&format!(
+                    "{}: valid flat array ({} packages)",
+                    index_path,
+                    index_entries.len()
+                ));
                 let mut seen = HashSet::new();
                 for entry in &index_entries {
                     if entry.pkg_name.is_empty() {
@@ -1182,7 +1955,10 @@ pub fn validate(index_path: &str, packages_dir: &str) -> Result<usize> {
                         problems += 1;
                     }
                     if seen.contains(&(entry.pkg_name.clone(), entry.version.clone())) {
-                        UserInterface::error(&format!("{} v{}: duplicate entry", entry.pkg_name, entry.version));
+                        UserInterface::error(&format!(
+                            "{} v{}: duplicate entry",
+                            entry.pkg_name, entry.version
+                        ));
                         problems += 1;
                     }
                     seen.insert((entry.pkg_name.clone(), entry.version.clone()));
@@ -1197,43 +1973,64 @@ pub fn validate(index_path: &str, packages_dir: &str) -> Result<usize> {
 
     let pkg_dir = Path::new(packages_dir);
     if pkg_dir.exists() && !index_entries.is_empty() {
-        let index_names: HashSet<String> = index_entries.iter().map(|e| e.pkg_name.clone()).collect();
+        let index_names: HashSet<String> =
+            index_entries.iter().map(|e| e.pkg_name.clone()).collect();
         let mut built_names = HashSet::new();
         for entry in fs::read_dir(pkg_dir)? {
             let entry = entry?;
             let fname = entry.file_name().to_string_lossy().into_owned();
             if fname.ends_with(".xcs") {
-                let stem = fname.trim_end_matches(".xcs");
-                if let Some(pos) = stem.rfind('-') {
-                    built_names.insert(stem[..pos].to_string());
+                match parse_xcs_name(&fname) {
+                    Some((name, _version)) => {
+                        built_names.insert(name);
+                    }
+                    None => {
+                        UserInterface::warning(&format!(
+                            "{}: filename does not match <name>-<version>.xcs",
+                            fname
+                        ));
+                        problems += 1;
+                    }
                 }
             }
         }
         let orphaned: Vec<&String> = built_names.difference(&index_names).collect();
         for name in &orphaned {
-            UserInterface::warning(&format!("{}: built .xcs found but no entry in {}", name, index_path));
+            UserInterface::warning(&format!(
+                "{}: built .xcs found but no entry in {}",
+                name, index_path
+            ));
         }
         let missing: Vec<&String> = index_names.difference(&built_names).collect();
         for name in &missing {
-            UserInterface::warning(&format!("{}: in {} but no .xcs in {}", name, index_path, packages_dir));
+            UserInterface::warning(&format!(
+                "{}: in {} but no .xcs in {}",
+                name, index_path, packages_dir
+            ));
         }
-        UserInterface::success(&format!("{} built, {} indexed, {} orphaned, {} missing",
-            built_names.len(), index_entries.len(), orphaned.len(), missing.len()));
+        UserInterface::success(&format!(
+            "{} built, {} indexed, {} orphaned, {} missing",
+            built_names.len(),
+            index_entries.len(),
+            orphaned.len(),
+            missing.len()
+        ));
     }
 
     if pkg_dir.exists() {
         for entry in fs::read_dir(pkg_dir)? {
             let entry = entry?;
             let fname = entry.file_name().to_string_lossy().into_owned();
-            if !fname.ends_with(".xcs") { continue; }
+            if !fname.ends_with(".xcs") {
+                continue;
+            }
             let path = entry.path();
             let mut file = fs::File::open(&path)?;
             let mut magic = [0u8; 4];
-            if file.read_exact(&mut magic).is_ok()
-                && magic != [0x28, 0xB5, 0x2F, 0xFD] {
-                    UserInterface::warning(&format!("{}: not a valid zstd archive (bad magic)", fname));
-                    problems += 1;
-                }
+            if file.read_exact(&mut magic).is_ok() && magic != [0x28, 0xB5, 0x2F, 0xFD] {
+                UserInterface::warning(&format!("{}: not a valid zstd archive (bad magic)", fname));
+                problems += 1;
+            }
         }
     }
 
@@ -1254,10 +2051,17 @@ pub fn checksum_index(index_path: &str, pkg_dir: &str, base_url: &str, arch: &st
     let content = fs::read_to_string(index_file)?;
     let mut index: Vec<PackageMetadata> = serde_json::from_str(&content)?;
 
-    let pattern = Regex::new(r"^(.*)-(\d[^-]*)\.xcs$")?;
     let mut by_key: HashMap<(String, String), usize> = HashMap::new();
+    let mut duplicates = 0usize;
     for (i, entry) in index.iter().enumerate() {
-        by_key.insert((entry.pkg_name.clone(), entry.version.clone()), i);
+        let key = (entry.pkg_name.clone(), entry.version.clone());
+        if by_key.insert(key.clone(), i).is_some() {
+            duplicates += 1;
+            UserInterface::warning(&format!(
+                "{} v{}: duplicate index entry — the later one replaces the earlier",
+                key.0, key.1
+            ));
+        }
     }
 
     let mut count = 0;
@@ -1266,31 +2070,54 @@ pub fn checksum_index(index_path: &str, pkg_dir: &str, base_url: &str, arch: &st
         for entry in fs::read_dir(pkg_path)? {
             let entry = entry?;
             let fname = entry.file_name().to_string_lossy().into_owned();
-            if !fname.ends_with(".xcs") { continue; }
-            if let Some(caps) = pattern.captures(&fname) {
-                let pkg_name = caps[1].to_string();
-                let version = caps[2].to_string();
-                if let Some(&idx) = by_key.get(&(pkg_name.clone(), version.clone())) {
-                    let file_bytes = fs::read(entry.path())?;
-                    use sha2::Digest;
-                    let mut hasher = Sha256::new();
-                    hasher.update(&file_bytes);
-                    let result = hasher.finalize();
-                    let hash = result.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                    index[idx].checksum = Checksum { kind: "sha256".to_string(), value: hash.clone() };
-                    index[idx].source = format!("{}/pool/{}/{}/{}.xcs", base_url.trim_end_matches('/'), arch, pkg_name, fname);
-                    count += 1;
-                    if env::var("OUS_QUIET").is_err() {
-                        UserInterface::info(&format!("{} -> sha256={}...", fname, &hash[..16]));
-                    }
+            if !fname.ends_with(".xcs") {
+                continue;
+            }
+            let Some((pkg_name, version)) = parse_xcs_name(&fname) else {
+                UserInterface::warning(&format!(
+                    "Skipping '{}': filename does not match <name>-<version>.xcs",
+                    fname
+                ));
+                continue;
+            };
+            if let Some(&idx) = by_key.get(&(pkg_name.clone(), version.clone())) {
+                let file_bytes = fs::read(entry.path())?;
+                let mut hasher = Sha256::new();
+                hasher.update(&file_bytes);
+                let result = hasher.finalize();
+                let hash = result
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
+                index[idx].checksum = Checksum {
+                    kind: "sha256".to_string(),
+                    value: hash.clone(),
+                };
+                index[idx].source = format!(
+                    "{}/pool/{}/{}/{}.xcs",
+                    base_url.trim_end_matches('/'),
+                    arch,
+                    pkg_name,
+                    fname
+                );
+                count += 1;
+                if env::var("OUS_QUIET").is_err() {
+                    UserInterface::info(&format!("{} -> sha256={}...", fname, &hash[..16]));
                 }
             }
         }
     }
 
     let json = serde_json::to_string_pretty(&index)?;
-    fs::write(index_file, json)?;
-    UserInterface::success(&format!("Updated {} entries in {}", count, index_path));
+    atomic_write(index_file, json.as_bytes())?;
+    if duplicates > 0 {
+        UserInterface::warning(&format!(
+            "Updated {} entries in {} ({} duplicate keys resolved last-wins)",
+            count, index_path, duplicates
+        ));
+    } else {
+        UserInterface::success(&format!("Updated {} entries in {}", count, index_path));
+    }
     Ok(())
 }
 
@@ -1301,25 +2128,46 @@ pub fn rewrite_source(index_path: &str, base_url: &str, arch: &str) -> Result<()
     }
     let content = fs::read_to_string(index_file)?;
     let mut index: Vec<PackageMetadata> = serde_json::from_str(&content)?;
+    if !env::var("OUS_ASSUME_YES").is_ok()
+        && !UserInterface::prompt_confirmation(&format!(
+            "Rewrite source URLs for {} entries in {}?",
+            index.len(),
+            index_path
+        ))
+    {
+        return Err(anyhow!("Aborted: source URL rewrite not confirmed"));
+    }
     for entry in &mut index {
-        let url = format!("{}/pool/{}/{}/{}-{}.xcs",
-            base_url.trim_end_matches('/'), arch, entry.pkg_name, entry.pkg_name, entry.version);
+        let url = format!(
+            "{}/pool/{}/{}/{}-{}.xcs",
+            base_url.trim_end_matches('/'),
+            arch,
+            entry.pkg_name,
+            entry.pkg_name,
+            entry.version
+        );
         entry.source = url;
     }
     let json = serde_json::to_string_pretty(&index)?;
-    fs::write(index_file, json)?;
-    UserInterface::success(&format!("Rewrote source URLs in {} ({} packages)", index_path, index.len()));
+    atomic_write(index_file, json.as_bytes())?;
+    UserInterface::success(&format!(
+        "Rewrote source URLs in {} ({} packages)",
+        index_path,
+        index.len()
+    ));
     Ok(())
 }
 
 pub fn sign_packages(index_path: &str, packages_dir: &str, key_id: &str) -> Result<()> {
+    let mut failures = 0usize;
     let mut args = vec!["--batch", "--yes", "-u", key_id, "--detach-sign"];
     let index_file = Path::new(index_path);
     if index_file.exists() {
         args.push(index_path);
         let status = Command::new("gpg").args(&args).status()?;
         if !status.success() {
-            UserInterface::warning(&format!("GPG signing of {} failed", index_path));
+            UserInterface::error(&format!("GPG signing of {} failed", index_path));
+            failures += 1;
         } else {
             UserInterface::success(&format!("Signed: {}", index_path));
         }
@@ -1338,11 +2186,22 @@ pub fn sign_packages(index_path: &str, packages_dir: &str, key_id: &str) -> Resu
                 } else if md.file_type().is_symlink() {
                     continue;
                 } else if path.extension().is_some_and(|e| e == "xcs") {
+                    let path_str = path.to_string_lossy().into_owned();
                     let mut sign_args = vec!["--batch", "--yes", "-u", key_id, "--detach-sign"];
-                    sign_args.push(path.to_str().expect("valid UTF-8 path"));
+                    sign_args.push(path_str.as_str());
                     let status = Command::new("gpg").args(&sign_args).status()?;
-                    if status.success() && env::var("OUS_QUIET").is_err() {
-                        UserInterface::info(&format!("Signed: {}", path.file_name().expect("path has file name").to_string_lossy()));
+                    if status.success() {
+                        if env::var("OUS_QUIET").is_err() {
+                            UserInterface::info(&format!(
+                                "Signed: {}",
+                                path.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            ));
+                        }
+                    } else {
+                        UserInterface::error(&format!("GPG signing of {} failed", path.display()));
+                        failures += 1;
                     }
                 }
             }
@@ -1355,5 +2214,232 @@ pub fn sign_packages(index_path: &str, packages_dir: &str, key_id: &str) -> Resu
         fs::write("pubkey.asc", &output.stdout)?;
         UserInterface::success("Exported public key: pubkey.asc");
     }
+
+    if failures > 0 {
+        return Err(anyhow!("{} package(s) failed GPG signing", failures));
+    }
     Ok(())
+}
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "ous-lib-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // C1: a failing build command must propagate its failure (the old
+    // `sh -c "... | tee"` swallowed the exit status of the pipeline head).
+    #[test]
+    fn test_build_failing_command_status_propagates() {
+        let dir = test_dir("build-fail");
+        let pkg = Package {
+            name: "t".into(),
+            version: "1.0".into(),
+            source: String::new(),
+            build_type: "custom".into(),
+            build: vec!["echo hello; exit 3".into()],
+            install: vec![],
+            dependencies: None,
+            links: None,
+            arch: "native".into(),
+            components: None,
+            services: None,
+            binaries: None,
+            sha256: None,
+        };
+        let err = build(&pkg, dir.to_str().unwrap()).expect_err("must fail");
+        assert!(err.to_string().contains("failed"), "error: {}", err);
+        // The combined capture.log is written before failing.
+        let log = fs::read_to_string(dir.join("capture.log")).unwrap_or_default();
+        assert!(log.contains("hello"), "capture.log missing output");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // C1: successful commands still capture their log.
+    #[test]
+    fn test_build_success_captures_log() {
+        let dir = test_dir("build-ok");
+        let pkg = Package {
+            name: "t".into(),
+            version: "1.0".into(),
+            source: String::new(),
+            build_type: "custom".into(),
+            build: vec!["echo built-it 1>&2".into()],
+            install: vec![],
+            dependencies: None,
+            links: None,
+            arch: "native".into(),
+            components: None,
+            services: None,
+            binaries: None,
+            sha256: None,
+        };
+        let log = build(&pkg, dir.to_str().unwrap()).expect("must succeed");
+        assert!(log.contains("built-it"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // M1/M2 helpers: force strips the tail steps from resume state.
+    #[test]
+    fn test_force_strips_tail_steps() {
+        let mut state = BuildProgress::default();
+        for step in ["fetch", "build", "install", "hash", "metadata", "archive"] {
+            state.completed_steps.insert(step.to_string());
+        }
+        for step in ["archive", "hash", "metadata"] {
+            state.completed_steps.remove(step);
+        }
+        assert!(state.completed_steps.contains("fetch"));
+        assert!(state.completed_steps.contains("build"));
+        assert!(state.completed_steps.contains("install"));
+        assert!(!state.completed_steps.contains("hash"));
+        assert!(!state.completed_steps.contains("metadata"));
+        assert!(!state.completed_steps.contains("archive"));
+    }
+
+    // m4: filename parser variants, including prerelease suffixes.
+    #[test]
+    fn test_parse_xcs_name_variants() {
+        assert_eq!(
+            parse_xcs_name("hello-1.0.xcs"),
+            Some(("hello".into(), "1.0".into()))
+        );
+        assert_eq!(
+            parse_xcs_name("libfoo-1.0-beta.xcs"),
+            Some(("libfoo".into(), "1.0-beta".into()))
+        );
+        assert_eq!(
+            parse_xcs_name("shared-mime-info-2.4rc1.xcs"),
+            Some(("shared-mime-info".into(), "2.4rc1".into()))
+        );
+        assert_eq!(
+            parse_xcs_name("openssl-3.2.1.tar.gz.xcs"),
+            None,
+            "garbage versions must not parse"
+        );
+        assert_eq!(parse_xcs_name("noversion.xcs"), None);
+        assert_eq!(parse_xcs_name("-1.0.xcs"), None, "empty name rejected");
+    }
+
+    // m24: natural version ordering in the index sort key.
+    #[test]
+    fn test_version_sort_key_natural() {
+        assert!(version_sort_key("1.10") > version_sort_key("1.9"));
+        assert!(version_sort_key("1.2") < version_sort_key("1.10"));
+        assert_eq!(version_sort_key("1.0"), version_sort_key("1.0"));
+    }
+
+    // m1/m2: component assignment with trailing slashes and overlap.
+    #[test]
+    fn test_assign_components_trailing_slash_and_overlap() {
+        let pkg_files = vec![
+            "system/bin/app".to_string(),
+            "system/lib/liba.so".to_string(),
+            "share/doc/readme".to_string(),
+        ];
+        let pkg = Package {
+            name: "t".into(),
+            version: "1.0".into(),
+            source: String::new(),
+            build_type: "custom".into(),
+            build: vec![],
+            install: vec![],
+            dependencies: None,
+            links: None,
+            arch: "native".into(),
+            components: Some(vec![
+                ComponentSpec {
+                    name: "runtime".into(),
+                    priority: "required".into(),
+                    files: vec!["system/".into(), "system/bin/app".into(), "".into()],
+                    description: String::new(),
+                },
+                ComponentSpec {
+                    name: "docs".into(),
+                    priority: "optional".into(),
+                    files: vec!["share/doc/".into()],
+                    description: String::new(),
+                },
+            ]),
+            services: None,
+            binaries: None,
+            sha256: None,
+        };
+        let comps = assign_components(&pkg_files, &pkg);
+        let runtime = comps.iter().find(|c| c.name == "runtime").unwrap();
+        let docs = comps.iter().find(|c| c.name == "docs").unwrap();
+        // Trailing-slash pattern matched the tree...
+        assert!(runtime.files.contains(&PathBuf::from("system/bin/app")));
+        assert!(runtime.files.contains(&PathBuf::from("system/lib/liba.so")));
+        // ...and first-spec-wins kept it away from the overlapping later spec.
+        assert!(!docs.files.contains(&PathBuf::from("system/bin/app")));
+        assert!(docs.files.contains(&PathBuf::from("share/doc/readme")));
+    }
+
+    // M12: symlink link paths may not escape the staging root.
+    #[test]
+    fn test_symlink_escape_rejected() {
+        let root = test_dir("symlink-root");
+        let outside = test_dir("symlink-outside");
+        // Traversal via ".."
+        assert!(
+            symlink(
+                "/etc/passwd",
+                "../../etc/cron.d/evil",
+                root.to_str().unwrap()
+            )
+            .is_err()
+        );
+        // A plain valid link still works.
+        symlink("../data/blob", "system/share/link", root.to_str().unwrap())
+            .expect("valid link must succeed");
+        assert!(
+            root.join("system/share/link").is_symlink() || root.join("system/share/link").exists()
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    // M12: raw version interpolation into the output filename rejects
+    // traversal.
+    #[test]
+    fn test_version_component_validation() {
+        assert!(validate_version_component("1.0-beta", "package version").is_ok());
+        assert!(validate_version_component("../evil", "package version").is_err());
+        assert!(validate_version_component("a/b", "package version").is_err());
+        assert!(validate_version_component("", "package version").is_err());
+    }
+
+    // M8: atomic_write renames over existing targets and leaves a valid file.
+    #[test]
+    fn test_atomic_write_overwrites_existing() {
+        let dir = test_dir("atomic");
+        let target = dir.join("file.json");
+        atomic_write(&target, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        atomic_write(&target, b"second-and-longer").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second-and-longer");
+        // No temp litter left behind.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with('.') && n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {:?}", leftovers);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

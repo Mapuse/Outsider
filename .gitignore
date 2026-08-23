@@ -2,3 +2,6 @@
 /.sixth
 /output
 /pool
+# Meson/Ninja build dir + generated cross file
+builddir/
+scripts/cross.txt

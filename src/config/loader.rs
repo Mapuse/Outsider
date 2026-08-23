@@ -54,6 +54,20 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let toml = toml::to_string_pretty(cfg).unwrap_or_default();
+    let toml = match toml::to_string_pretty(cfg) {
+        Ok(t) if !t.trim().is_empty() => t,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "refusing to write empty config",
+            ));
+        }
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            ));
+        }
+    };
     fs::write(path, toml)
 }

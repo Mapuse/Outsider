@@ -7,7 +7,8 @@ DESTDIR  ?=
 # ── cps: external package, fetched from upstream ─────────────────────────
 CPS_URL ?= https://github.com/Mapuse/CPS
 CPS_DIR ?= $(HOME)/cudane-deps/cps
-CPS_REF ?= d8d5f7da49917ea7636147b8a65f3541311c45ab
+# CPS_REV lives in env.mk — the single source of truth shared by every builder.
+CPS_REF ?= $(CPS_REV)
 
 $(CPS_DIR):
 	git clone $(CPS_URL) $(CPS_DIR)
@@ -37,13 +38,17 @@ install-man:
 install-cps: cps-pkg
 	install -Dm755 $(CURDIR)/target/cps/release/cps $(DESTDIR)$(PREFIX)/bin/cps
 	install -d $(DESTDIR)$(PREFIX)/share/cps/themes $(DESTDIR)$(PREFIX)/share/cps/examples
-	install -m644 $(CPS_DIR)/themes/*.py $(DESTDIR)$(PREFIX)/share/cps/themes/
-	install -m644 $(CPS_DIR)/t.desc $(CPS_DIR)/p.desc $(DESTDIR)$(PREFIX)/share/cps/
-	install -m644 $(CPS_DIR)/examples/*.py $(DESTDIR)$(PREFIX)/share/cps/examples/
+	if [ -d themes ]; then install -m644 themes/*.py $(DESTDIR)$(PREFIX)/share/cps/themes/; fi
+	if [ -d "$(CPS_DIR)/themes" ]; then \
+		install -m644 $(CPS_DIR)/themes/*.py $(DESTDIR)$(PREFIX)/share/cps/themes/; fi
+	if [ -f "$(CPS_DIR)/t.desc" ]; then install -m644 $(CPS_DIR)/t.desc $(CPS_DIR)/p.desc $(DESTDIR)$(PREFIX)/share/cps/; fi
+	if [ -d "$(CPS_DIR)/examples" ]; then install -m644 $(CPS_DIR)/examples/*.py $(DESTDIR)$(PREFIX)/share/cps/examples/; fi
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/ous
 	rm -f $(DESTDIR)$(PREFIX)/bin/cps
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/ous.1
+	rm -rf $(DESTDIR)$(PREFIX)/share/cps
 
 clean:
 	cargo clean

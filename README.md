@@ -542,16 +542,42 @@ Each discovered dependency records a human-readable `dep_type` (see [Metadata]),
 
 All build systems auto-detect `x86_64`/`aarch64` and select the correct musl target. Cross-compilation defaults live in `env.mk` (Make) and `toolchain.cmake` (CMake); meson and ninja need no extra files. The pinned `cps` revision is shared through `CPS_REV` in `env.mk`.
 
+### Target profiles
+
+| Profile | Rust triple | Prefix | Notes |
+| ------- | ----------- | ------ | ----- |
+| **amd64** | `x86_64-unknown-linux-musl` | `/system` | x86-64-v3 micro-arch, musl-libc |
+| **arm64** | `aarch64-unknown-linux-musl` | `/system` | armv8-a, musl-libc |
+
+`env.mk` auto-detects the host arch (`x86_64` → `amd64`, `aarch64` → `arm64`) and exports `RUST_TARGET` accordingly. All build systems consume this to select the correct triple.
+
 ### Cargo (direct)
 
+**Native:**
+
 ```shell
-cargo build --release
+cargo build --release --locked
 # Binary: target/release/ous
-# Install:
 install -Dm755 target/release/ous /system/bin/ous
 ```
 
+**Cross-compile for amd64:**
+
+```shell
+cargo build --release --locked --target x86_64-unknown-linux-musl
+install -Dm755 target/x86_64-unknown-linux-musl/release/ous /system/bin/ous
+```
+
+**Cross-compile for arm64:**
+
+```shell
+cargo build --release --locked --target aarch64-unknown-linux-musl
+install -Dm755 target/aarch64-unknown-linux-musl/release/ous /system/bin/ous
+```
+
 ### Make
+
+**Native:**
 
 ```shell
 make build                    # auto-detects arch, builds for host
@@ -559,15 +585,23 @@ make install                  # installs to /system/bin/ous
 make install DESTDIR=/mnt     # staged install
 ```
 
-### Meson
+**Cross-compile for amd64:**
 
 ```shell
-meson setup builddir -Dprefix=/system -Dprofile=release
-meson compile -C builddir
-meson install -C builddir
+make build RUST_TARGET=x86_64-unknown-linux-musl
+make install RUST_TARGET=x86_64-unknown-linux-musl
+```
+
+**Cross-compile for arm64:**
+
+```shell
+make build RUST_TARGET=aarch64-unknown-linux-musl
+make install RUST_TARGET=aarch64-unknown-linux-musl
 ```
 
 ### Ninja
+
+**Native:**
 
 ```shell
 ninja -f build.ninja                       # build ous
@@ -575,10 +609,60 @@ DESTDIR=/mnt ninja -f build.ninja install  # staged install (PREFIX defaults to 
 ninja -f build.ninja cps-install           # also fetch/build/install cps + its data
 ```
 
+**Cross-compile (amd64 / arm64):**
+
+Ninja auto-detects the host architecture. For cross-compilation, edit `build.ninja` to set the correct `RUST_TARGET` and linker flags, or invoke via Make/CMake wrappers that inject the target triple.
+
+### Meson
+
+**Native:**
+
+```shell
+meson setup builddir --prefix=/system
+meson compile -C builddir
+meson install -C builddir
+```
+
+**Cross-compile for amd64:**
+
+```shell
+./scripts/crossgen.sh x86_64-unknown-linux-musl
+meson setup builddir --cross-file cross.txt --prefix=/system
+meson compile -C builddir
+meson install -C builddir
+```
+
+**Cross-compile for arm64:**
+
+```shell
+./scripts/crossgen.sh aarch64-unknown-linux-musl
+meson setup builddir --cross-file cross.txt --prefix=/system
+meson compile -C builddir
+meson install -C builddir
+```
+
 ### CMake
+
+**Native:**
+
+```shell
+cmake -B build -DCMAKE_INSTALL_PREFIX=/system
+cmake --build build
+cmake --install build
+```
+
+**Cross-compile for amd64:**
 
 ```shell
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake -DCMAKE_INSTALL_PREFIX=/system
+cmake --build build
+cmake --install build
+```
+
+**Cross-compile for arm64:**
+
+```shell
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake -DCMAKE_INSTALL_PREFIX=/system -DRUST_TARGET=aarch64-unknown-linux-musl
 cmake --build build
 cmake --install build
 ```
@@ -592,6 +676,16 @@ cmake --install build
 
 > [!TIP]
 > When `--no-auto` is passed, the program sets the `OUS_NO_AUTO` environment variable to disable the auto behaviors for empty `build` and `install` arrays.
+
+### Environment variables
+
+| Variable | Description |
+| -------- | ----------- |
+| `RUST_TARGET` | Rust target triple (`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`). Auto-detected by `env.mk`; consumed by Make, Meson, and CMake toolchain files. |
+| `PROFILE` | Build profile (`release` / `debug`). Controls optimization flags and LTO. Defaults to `release` in all build systems. |
+| `PREFIX` | Install prefix (default: `/system`). Passed to `--prefix` / `CMAKE_INSTALL_PREFIX` / `DESTDIR` as appropriate. |
+| `DESTDIR` | Staged install root. Prepended to `PREFIX` so files land under `DESTDIR/system/bin/ous` instead of `/system/bin/ous`. |
+| `CPS_REV` | Pinned git revision for the CPS companion binary + data. Shared across all build systems via `env.mk`. |
 
 ## Building Variables
 

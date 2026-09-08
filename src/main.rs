@@ -71,8 +71,8 @@ fn value_flag_arity(flag: &str) -> Option<usize> {
         "-a" | "--archive" | "-x" | "--extract" | "-w" | "--write" => 2,
         "-i" | "--inspect" | "-m" | "--manifest" | "-o" | "--output" | "-j" | "--jobs" | "-z"
         | "--zstd-level" | "-p" | "--project" | "-t" | "--target" | "-b" | "--hash-type"
-        | "--sort" | "--validate" | "--checksum" | "--sign" | "--source" | "--plugin"
-        | "--theme" | "--tui" | "--base-url" | "--arch" | "--key" => 1,
+        | "-u" | "--upload" | "--token" | "--sort" | "--validate" | "--checksum" | "--sign"
+        | "--source" | "--plugin" | "--theme" | "--tui" | "--base-url" | "--arch" | "--key" => 1,
         _ => return None,
     })
 }
@@ -158,6 +158,9 @@ fn print_help() {
     println!("    --base-url <URL>           Base URL for source rewriting (with --source)");
     println!("  -g, --sign <INDEX> <DIR>     GPG sign index + all .xcs packages");
     println!("    --key <KEYID>              GPG key ID for signing (with --sign)");
+    println!("  -u, --upload <URL>           Upload built .xcs + sidecar (+ index) by HTTP PUT");
+    println!("    --token <SECRET>           Bearer token for upload authorization");
+    println!("    --upload-index             Also upload the updated index.<arch>.json");
     UserInterface::info("PLUGIN / THEME / TUI:");
     println!("  --plugin list               List registered plugins");
     println!("  --plugin register|unregister  NOT SUPPORTED: edit p.desc instead");
@@ -743,6 +746,17 @@ fn main() -> Result<()> {
                 ous::rewrite_source(&index_path, &base_url, &arch)?;
                 sys_process::exit(0);
             }
+            "-u" | "--upload" => {
+                if let Some(val) = take_value() {
+                    unsafe { env::set_var("OUS_UPLOAD_URL", val) };
+                }
+            }
+            "--token" => {
+                if let Some(val) = take_value() {
+                    unsafe { env::set_var("OUS_UPLOAD_TOKEN", val) };
+                }
+            }
+            "--upload-index" => unsafe { env::set_var("OUS_UPLOAD_INDEX", "1") },
             "-g" | "--sign" => {
                 let index_path = take_value().unwrap_or_default();
                 let packages_dir = take_value().unwrap_or_else(|| ".".to_string());

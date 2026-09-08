@@ -1099,6 +1099,35 @@ Signs the index file and all `.xcs` packages with GPG detached ASCII-armored sig
 
 Requires `gpg` to be available on the system.
 
+## upload - HTTP Publishing
+
+```rust
+pub fn upload_package(opts: &UploadOptions, archive_abs: &Path,
+                      pkg_name: &str, pkg_version: &str,
+                      index_source: Option<&Path>) -> Result<Vec<String>>
+```
+
+Publishes a finished package to a remote repository over HTTP PUT. It is wired into the `process()` pipeline: whenever the archive step produces an `.xcs` (or an existing archive is reused), Outsider uploads the artifacts to the URL given by `--upload` (or `OUS_UPLOAD_URL`).
+
+Artifacts uploaded, following the pool layout that MCX consumes:
+
+1. `<base>/pool/<arch>/<name>/<name>-<version>.xcs` — the compressed archive.
+2. `<base>/pool/<arch>/<name>/<name>-<version>.xcs.sha256` — the integrity sidecar (a missing sidecar aborts publishing; the archive is never published without it).
+3. `<base>/index.<arch>.json` — the updated index, but **only** when `--upload-index` (or `OUS_UPLOAD_INDEX=1`) is set and the local index exists.
+
+Details:
+
+- Each upload is an HTTP PUT issued through `curl` with `--fail`; only a 2xx response counts as success.
+- Failures are retried with exponential backoff (4 attempts: 0.5s, 1s, 2s, then abort) and the build fails with a non-zero exit code if the archive cannot be published.
+- An optional bearer token (`--token <SECRET>` or `OUS_UPLOAD_TOKEN=<SECRET>`) is sent as `Authorization: Bearer <secret>`. Basic auth may be embedded in the URL (`https://user:pass@host/...`).
+- The base URL must be `http://` or `https://`.
+
+**Usage:**
+
+```sh
+ous manifest.json out/ --upload https://repo.example.org --token "$TOKEN" --upload-index
+```
+
 ## Build / Resume
 
 `Outsider` features a **resumable build pipeline** that allows it to continue from the exact byte it stopped on, provided the workspace directory (`.ous/`) has not been deleted.
@@ -1465,6 +1494,9 @@ The CLI supports the following flags, each of which sets a corresponding environ
 | `-q` | `--quiet` | `OUS_QUIET=1` | Suppress non-error output |
 | `-y` | `--yes` | `OUS_ASSUME_YES=1` | Assume yes to all prompts |
 | `-p` | `--project <DIR>` | `OUS_PROJECT_WORKSPACE=<DIR>` | Define custom project or workspace directory |
+| `-u` | `--upload <URL>` | `OUS_UPLOAD_URL=<URL>` | Upload built `.xcs` + sidecar by HTTP PUT |
+| | `--token <SECRET>` | `OUS_UPLOAD_TOKEN=<SECRET>` | Bearer token for upload authorization |
+| | `--upload-index` | `OUS_UPLOAD_INDEX=1` | Also upload the updated `index.<arch>.json` |
 
 ### Standalone Modes
 

@@ -135,6 +135,24 @@ GPG-detach-sign the index and every .xcs package.
 .B \-\-base\-url \fIURL\fR, \fB\-\-arch \fIARCH\fR, \fB\-\-key \fIKEYID\fR
 Repository modifiers consumed by the preceding commands; they may appear
 before or after the command they modify.
+.SH UPLOAD / PUBLISHING
+.TP
+.B \-u, \-\-upload \fIURL\fR
+Publish the built .xcs archive and its .sha256 sidecar to a remote repository
+over HTTP PUT, into pool/\fIarch\fR/\fIname\fR/. Ran automatically at the end
+of a package build and when an existing archive is reused. The base URL must
+be http:// or https://.
+.TP
+.B \-\-token \fISECRET\fR
+Bearer token sent as an \fBAuthorization: Bearer\fR header on uploads.
+.TP
+.B \-\-upload\-index
+Also upload the updated index.\fIarch\fR.json to the repository root.
+.TP
+.B Architecture
+Derived from the manifest's \fBarch\fR field; the archive step must have
+produced the .sha256 sidecar or publishing is refused. Uploads retry with
+exponential backoff (4 attempts) and fail the run on persistent errors.
 .SH PLUGIN / THEME / TUI
 .TP
 .B \-\-plugin \fIlist|run|reload\fR ...
@@ -153,7 +171,8 @@ files directly.
 .TP
 .B OUS_TARGET, OUS_JOBS, OUS_PARALLEL, OUS_FORCE, OUS_CLEAN, OUS_NO_AUTO,
 .B OUS_STRICT, OUS_DEBUG, OUS_QUIET, OUS_ASSUME_YES, OUS_ZSTD_LEVEL,
-.B OUS_HASH_TYPE, OUS_PROJECT_WORKSPACE
+.B OUS_HASH_TYPE, OUS_PROJECT_WORKSPACE, OUS_UPLOAD_URL, OUS_UPLOAD_TOKEN,
+.B OUS_UPLOAD_INDEX
 Equivalent to the like-named command line options; flags take precedence.
 .TP
 .B CUDANE_REPO_URL, CUDANE_TARGET

@@ -15,6 +15,7 @@ use std::{
 
 pub mod config;
 pub mod deps;
+pub mod upload;
 pub mod utils;
 use crate::utils::ui::UserInterface;
 
@@ -1616,6 +1617,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
             "Package archive already exists at: {}",
             final_path
         ));
+        upload_step(pkg, &final_path, &current_dir)?;
         return Ok(final_path);
     }
 
@@ -1816,7 +1818,41 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     }
 
     fire_hook("done", &pkg.name);
+    upload_step(pkg, &final_path, &current_dir)?;
     Ok(final_path)
+}
+
+/// Upload the finished archive (plus `.sha256` sidecar and, when requested,
+/// the updated index) to the repository referenced by `OUS_UPLOAD_URL`. A
+/// no-op when no upload URL is configured.
+fn upload_step(pkg: &Package, final_path: &str, cwd: &Path) -> Result<()> {
+    let Ok(base_url) = env::var("OUS_UPLOAD_URL") else {
+        return Ok(());
+    };
+    if base_url.trim().is_empty() {
+        return Ok(());
+    }
+    let arch = if pkg.arch.is_empty() {
+        "native".to_string()
+    } else {
+        pkg.arch.clone()
+    };
+    let opts = crate::upload::UploadOptions {
+        base_url: base_url.trim().to_string(),
+        token: env::var("OUS_UPLOAD_TOKEN").ok(),
+        arch: arch.clone(),
+        upload_index: env::var("OUS_UPLOAD_INDEX").is_ok(),
+    };
+    let index_source = cwd.join(crate::upload::index_path(&arch));
+    let uploaded =
+        crate::upload::upload_package(&opts, Path::new(final_path), &pkg.name, &pkg.version, Some(&index_source))?;
+    UserInterface::success(&format!(
+        "Published {} v{} — {} file(s) uploaded",
+        pkg.name,
+        pkg.version,
+        uploaded.len()
+    ));
+    Ok(())
 }
 
 fn run_build_step(

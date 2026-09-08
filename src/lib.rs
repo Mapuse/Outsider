@@ -543,6 +543,14 @@ pub fn build(pkg: &Package, dir: &str) -> Result<String> {
 
     let mut full_log = String::new();
 
+    // Per-command resume markers (from-bit completion): a marker is written
+    // only after its build command succeeded, so a failed build re-run starts
+    // from the first command that did NOT complete instead of repeating every
+    // step from the top. Markers live inside the source dir and are keyed by
+    // the command's own SHA-256, so editing the manifest invalidates them,
+    // and both --force and --clean bypass them entirely.
+    let resume = env::var("OUS_FORCE").is_err() && env::var("OUS_CLEAN").is_err();
+
     for (i, cmd) in pkg.build.iter().enumerate() {
         let trimmed = cmd.trim();
         if trimmed.eq_ignore_ascii_case("none")
@@ -550,6 +558,16 @@ pub fn build(pkg: &Package, dir: &str) -> Result<String> {
             || trimmed.eq_ignore_ascii_case("nothing")
         {
             UserInterface::warning(&format!("Skipping build command {} as requested", i + 1));
+            continue;
+        }
+
+        let marker = build_command_marker(dir, i, trimmed);
+        if resume && marker.is_file() {
+            UserInterface::info(&format!(
+                "Resuming from last completed bit — skipping build command {}/{} (use --force to rerun)",
+                i + 1,
+                pkg.build.len()
+            ));
             continue;
         }
 
@@ -587,11 +605,30 @@ pub fn build(pkg: &Package, dir: &str) -> Result<String> {
                 combined.trim_end()
             ));
         }
+        // Command succeeded — drop a durable marker so an interrupted batch
+        // continues from the last completed command instead of resubmitting
+        // finished work. A failure above leaves no marker for this command.
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&marker, b"ok")?;
         let _ = fs::remove_file(&log_path);
         full_log.push_str(&combined);
     }
 
     Ok(full_log)
+}
+
+/// Path of the from-bit completion marker for build command `index` (0-based)
+/// inside the source directory.
+fn build_command_marker(dir: &str, index: usize, cmd: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(cmd.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).take(16).collect();
+    Path::new(dir)
+        .join(".ous-build")
+        .join(format!("cmd-{}-{}.done", index + 1, hex))
 }
 
 pub fn symlink(target: &str, link_path: &str, root_dir: &str) -> Result<()> {
@@ -2376,6 +2413,65 @@ mod tests {
         assert!(version_sort_key("1.10") > version_sort_key("1.9"));
         assert!(version_sort_key("1.2") < version_sort_key("1.10"));
         assert_eq!(version_sort_key("1.0"), version_sort_key("1.0"));
+    }
+
+    // from-bit build: a failed build re-run must continue from the first
+    // command that did NOT complete, not resubmit already-finished ones.
+    #[test]
+    fn test_build_resume_skips_completed_commands() {
+        // Ensure the resume markers are honoured in this test regardless of
+        // any ambient --force/--clean variables in the host environment.
+        unsafe {
+            std::env::remove_var("OUS_FORCE");
+            std::env::remove_var("OUS_CLEAN");
+        }
+        let dir = test_dir("build-resume");
+        let pkg = Package {
+            name: "t".into(),
+            version: "1.0".into(),
+            source: String::new(),
+            build_type: "custom".into(),
+            build: vec!["touch resume-probe".into(), "exit 3".into()],
+            install: vec![],
+            dependencies: None,
+            links: None,
+            arch: "native".into(),
+            components: None,
+            services: None,
+            binaries: None,
+            sha256: None,
+        };
+        // First run: command 1 succeeds (marker written), command 2 fails.
+        let first = build(&pkg, dir.to_str().unwrap());
+        assert!(first.is_err(), "command 2 must fail");
+        assert!(dir.join("resume-probe").exists(), "command 1 ran");
+        let marker = build_command_marker(dir.to_str().unwrap(), 0, "touch resume-probe");
+        assert!(marker.is_file(), "marker for command 1 must exist");
+
+        // Wipe the side effect, then re-run: command 1 is skipped via its
+        // marker, so the probe file must NOT reappear; command 2 fails again.
+        let _ = fs::remove_file(dir.join("resume-probe"));
+        let second = build(&pkg, dir.to_str().unwrap());
+        assert!(second.is_err(), "command 2 still fails");
+        assert!(
+            !dir.join("resume-probe").exists(),
+            "command 1 must be skipped on resume"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // from-bit build: markers are keyed by the command's content hash, so
+    // editing a build step in the manifest invalidates its marker.
+    #[test]
+    fn test_build_marker_keyed_by_command_hash() {
+        let dir = test_dir("build-marker-hash");
+        let a = build_command_marker(dir.to_str().unwrap(), 2, "make -j8");
+        let b = build_command_marker(dir.to_str().unwrap(), 2, "make -j16");
+        assert_ne!(a, b, "different commands must map to different markers");
+        // Same command always maps to the same marker path.
+        let c = build_command_marker(dir.to_str().unwrap(), 2, "make -j8");
+        assert_eq!(a, c);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // m1/m2: component assignment with trailing slashes and overlap.

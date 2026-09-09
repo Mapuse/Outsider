@@ -1,7 +1,7 @@
-/target
-/.sixth
-/output
-/pool
-# Meson/Ninja build dir + generated cross file
+x86_64/
+aarch64/
+target/
+output/
+pool/
 builddir/
 scripts/cross.txt

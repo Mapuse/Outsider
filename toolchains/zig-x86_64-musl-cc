@@ -1,0 +1,38 @@
+#!/bin/sh
+# zig cc/ld wrapper for the amd64 musl target. rust toolchains hand a C
+# compiler/linker rustc triples (`x86_64-unknown-linux-musl` /
+# `aarch64-unknown-linux-musl`); zig uses the shorthand (`x86_64-linux-musl` /
+# `aarch64-linux-musl`), so this wrapper translates the triple and delegates
+# everything else to `zig cc`. Also drops arguments meaningless for zig's lld
+# (a glibc `--sysroot=*` and the cosmetic `--fix-cortex-a53-843419`).
+# Requires `zig` on PATH.
+out=""
+skip=0
+i=0
+for a in "$@"; do
+    i=$((i+1))
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+        --target=x86_64-unknown-linux-musl) out="$out --target=x86_64-linux-musl" ;;
+        --target=aarch64-unknown-linux-musl) out="$out --target=aarch64-linux-musl" ;;
+        -target)
+            nxt=""
+            j=0
+            for b in "$@"; do
+                j=$((j+1))
+                if [ "$j" -eq $((i+1)) ]; then nxt="$b"; break; fi
+            done
+            case "$nxt" in
+                x86_64-unknown-linux-musl) out="$out -target x86_64-linux-musl"; skip=1 ;;
+                aarch64-unknown-linux-musl) out="$out -target aarch64-linux-musl"; skip=1 ;;
+                *) out="$out \"$a\"" ;;
+            esac
+            ;;
+        -march)
+            skip=1
+            ;;
+        x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|--sysroot=*|-Wl,--fix-cortex-a53-843419|-march=*) ;;
+        *) out="$out \"$a\"" ;;
+    esac
+done
+eval "exec zig cc $out"

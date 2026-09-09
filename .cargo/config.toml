@@ -5,20 +5,13 @@ rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-target",
     "-C", "link-arg=x86_64-unknown-linux-musl",
-    "-C", "link-arg=-march=x86-64-v3",
-    "-C", "link-arg=-O3",
-    "-C", "link-arg=-flto=full",
-    "-C", "link-arg=--sysroot=/system"
 ]
 
 [target.aarch64-unknown-linux-musl]
-linker = "clang"
+linker = "/home/m/Outsider/toolchains/zig-aarch64-musl-cc"
 rustflags = [
+    "-C", "link-self-contained=no",
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-target",
     "-C", "link-arg=aarch64-unknown-linux-musl",
-    "-C", "link-arg=-march=armv8-a",
-    "-C", "link-arg=-O3",
-    "-C", "link-arg=-flto=full",
-    "-C", "link-arg=--sysroot=/system"
 ]

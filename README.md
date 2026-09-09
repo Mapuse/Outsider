@@ -245,7 +245,7 @@ This creates a symlink at `pkg_root/system/lib/libexample.so` that points to `sy
 
 ### arch (String)
 
-The target architecture for the package. Supports multi-arch builds — common values are `"amd64"`, `"arm64"`, or `"native"` (which means build for the host architecture). When omitted from the manifest, it defaults to `"native"`. The architecture is propagated into the package metadata and can be used by downstream tools to select the correct package variant for a given target platform.
+The target architecture for the package. Supports multi-arch builds — common values are `"amd64"`, `"arm64"`, `"x86_64"`, `"aarch64"`, or `"native"` (which means build for the host architecture). When omitted from the manifest, it defaults to `"native"`. Values are canonicalized before storage: `amd64` becomes `x86_64`, `arm64` becomes `aarch64`; `x86_64`, `aarch64`, and `native` pass through unchanged; any other value is an error; an empty value defaults to `native`. The canonical architecture is written into the package metadata under the JSON key `architecture` (the manifest input key `arch` is accepted for backward compatibility) and determines the index file name (`index.<arch>.json`).
 
 ### components (Option\<Vec\<ComponentSpec\>\>)
 
@@ -305,11 +305,18 @@ Every built package generates a `metadata.json` file embedded inside the archive
 
 ```rust
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Checksum {
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PackageMetadata {
     pub pkg_name: String,
     pub version: String,
     pub license: String,
     pub source: String,
+    #[serde(alias = "arch", rename = "architecture", default)]
     pub arch: String,
     pub checksum: Checksum,
     pub dependencies: Vec<Dependency>,
@@ -327,11 +334,46 @@ Each field is populated as follows:
 - [**`pkg_name`**]: Mirrored directly from the manifest's `name` field.
 - [**`version`**]: Mirrored directly from the manifest's `version` field.
 - [**`source`**]: Mirrored directly from the manifest's `source` field.
-- [**`arch`**]: Mirrored directly from the manifest's `arch` field. Defaults to `""` when absent (backward compat with older metadata).
+- [**`architecture`**]: Mirrored from the manifest's `arch` field and written under the JSON key `architecture` (the legacy key `arch` is accepted for backward compatibility when deserializing). Values are canonicalized: `amd64` → `x86_64`, `arm64` → `aarch64`; `x86_64`/`aarch64`/`native` pass through; an empty value defaults to `"native"`.
 - [**`license`**]: Determined by the `license()` function, which scans the source directory for license files and extracts the license name using regex pattern matching.
-- [**`checksum`**]: A SHA-256 hex digest of the entire package staging directory, computed by `hash()` which pipes the directory through `tar -cf -` and hashes the resulting byte stream.
+- [**`checksum`**]: An object `{"kind":"<algorithm>","value":"<hex>"}` — the hash of the **uncompressed** tar stream of the staging directory, computed by `hash()` which pipes the directory through `tar -cf -` and hashes the resulting byte stream. This is informational metadata inside the package archive; it does not represent the transport-integrity digest of the compressed `.xcs` file (that value lives in the sidecar).
 - [**`provides`**]: Using `libdep` and `normalize` to list the libraries that the package provides.
 - [**`conflicts`**]: Using `scan` to scan for any conflicting links and list it.
+
+### Provenance
+
+In addition to the checksum and architecture metadata, every package carries a `provenance` block that records where its version came from at build time:
+
+```rust
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PackageProvenance {
+    pub source_type: String,
+    pub source_url: String,
+    pub source_revision: Option<String>,
+    pub built_at: String,
+    pub builder: String,
+}
+```
+
+Inside `metadata.json` it is serialized as:
+
+```json
+"provenance": {
+  "source_type": "dir" | "git" | "http" | "file" | "url",
+  "source_url": "<original source url-or-path at build time>",
+  "source_revision": "<git HEAD sha256 or sha256 of fetched source artifact, or null>",
+  "built_at": "<UTC RFC3339 timestamp of archive build>",
+  "builder": "ous-<version>"
+}
+```
+
+- [**`source_type`**]: Derived from the manifest `source` value: values starting `git@` or `git://` (or ending `.git`) map to `"git"`; `https://`/`http://` to `"http"`; `file://` to `"file"`; any other URL-shaped string to `"url"`; and local paths to `"dir"`.
+- [**`source_url`**]: The original `source` value captured at build time. It is never rewritten by `--checksum`/`--source`, which only normalize the top-level `source` field for repository layout.
+- [**`source_revision`**]: Best-effort and never fatal — the `git rev-parse HEAD` hash for git sources, otherwise `null`.
+- [**`built_at`**]: UTC RFC3339 timestamp of when the archive's metadata was produced.
+- [**`builder`**]: `ous-<version>` (currently `ous-0.7.0`) identifying the build engine.
+
+The `provenance` field is additive only: it has `#[serde(default)]`, so archives written by older builders deserialize normally, and downstream tooling that tolerates unknown fields is unaffected.
 
 ### Dependency
 
@@ -925,7 +967,7 @@ This function creates a symbolic link inside the package staging directory.
 pub fn hash(dir: &str) -> Result<String>
 ```
 
-This function computes a SHA-256 hash of the entire contents of a directory. The hash is deterministic — the same directory contents always produce the same hash.
+This function computes a SHA-256 hash of the **uncompressed** tar stream of a directory's contents. The hash is deterministic — the same directory contents always produce the same hash. The resulting `Checksum` object (`{"kind":"sha256","value":"<hex>"}`) is stored in `metadata.json` inside the package archive as informational metadata; it does not cover the compression step and therefore does not match the transport-integrity sidecar.
 
 **Implementation:**
 
@@ -1073,7 +1115,7 @@ Validates that the index file and built `.xcs` packages are consistent. Returns 
 pub fn checksum_index(index_path: &str, pkg_dir: &str, base_url: &str, arch: &str) -> Result<()>
 ```
 
-Computes SHA-256 checksums for each `.xcs` file and updates the corresponding index entry. Simultaneously rewrites the `source` URL to point to the pool path: `<base_url>/pool/<arch>/<name>/<name>-<version>.xcs`.
+Overwrites each index entry's `checksum` with the SHA-256 of the real **compressed** `.xcs` file (not the uncompressed tar-stream hash in `metadata.json`), so the index reflects the actual served bytes. Simultaneously normalizes the `source` field to the pool URL: `<base_url>/pool/<arch>/<name>/<name>-<version>.xcs`.
 
 **Usage:** `ous --checksum index.x86_64.json pool/ --base-url https://github.com/Mapuse/MCX --arch x86_64`
 
@@ -1222,7 +1264,7 @@ This is the main orchestrator function that ties together the entire build pipel
 
 11. **Index update**: `index()` appends or updates the entry in `index.<arch>.json` in the output root.
 
-12. **Archiving**: `archive(root_str, &final_path)` compresses the staging directory into the final `.xcs` file.
+12. **Archiving**: `archive(root_str, &final_path)` compresses the staging directory into the final `.xcs` file. Immediately after, the engine hashes the compressed archive and writes a `<name>-<ver>.xcs.sha256` sidecar containing the single-line hex SHA-256 of the compressed bytes — this is the transport-integrity value consumers verify.
 
 13. **State finalization**: After archiving, all steps are marked complete in `.state.json`. The next run will find the `.xcs` file and short-circuit.
 
@@ -1233,6 +1275,8 @@ This is the main orchestrator function that ties together the entire build pipel
 ## Python Subsystem
 
 Outsider uses a TOML configuration file at `etc/ous/p.desc` to define plugins. The plugin system is **completely open** — any Python code is accepted. The only validation is a syntax check (`python3 -c "compile(...)"`). There are no restrictions on what your plugin can do.
+
+`--plugin run` and `--plugin reload` require the `python` feature. When Outsider is compiled without it, these subcommands error immediately with a message directing you to rebuild with `cargo build --features python`.
 
 ### Plugin configuration (`etc/ous/p.desc`)
 
@@ -1514,7 +1558,7 @@ The CLI supports the following flags, each of which sets a corresponding environ
 | ------ | ----------- | -------- |
 | | `--sort <DIR> <ARCH>` | Sort `.xcs` files into `pool/<arch>/<name>/` directories |
 | | `--validate <INDEX> <DIR>` | Validate index + `.xcs` file consistency |
-| | `--checksum <INDEX> <DIR>` | Add SHA-256 checksums to index and rewrite source URLs |
+| | `--checksum <INDEX> <DIR>` | Overwrite index checksums with compressed-.xcs SHA-256 and normalize source URLs |
 | | `--source <INDEX>` | Rewrite source URLs in index to pool paths |
 | `-g` | `--sign <INDEX> <DIR>` | GPG sign index + all `.xcs` packages |
 
@@ -1539,7 +1583,7 @@ The `.xcs` Package is a **`zstd` Archive** compressed with `tar` at compression 
 - **Metadata Preservation**: File permissions, ownership, and timestamps are preserved.
 - **Modern Storage**: Zstandard is designed for modern-enough systems.
 
-Inside every `.xcs` archive, there is a `metadata.json` file at the root that contains the `PackageMetadata` structure. This allows downstream tools to inspect package properties without extracting the entire archive.
+Inside every `.xcs` archive, there is a `metadata.json` file at the tar root (`"./"`) that contains the `PackageMetadata` structure. This allows downstream tools to inspect package properties without extracting the entire archive. A detached `<name>-<ver>.xcs.sha256` sidecar is written alongside the archive at packaging time; it holds the single-line hex SHA-256 of the **compressed** `.xcs` bytes and is the value consumers use to verify transport integrity.
 
 </details>
 
@@ -1621,7 +1665,7 @@ rustflags = ["-C", "target-cpu=armv8-a", ...]
 
 ### Engine Integration
 
-- [**`Package.arch`**] — Set per-package in the manifest (defaults to `"native"` for backward compatibility).
+- [**`Package.arch`**] — Set per-package in the manifest (the manifest input key is `arch`; defaults to `"native"` for backward compatibility). The canonical value is written to metadata under the JSON key `architecture`.
 - [**`OUS_TARGET`**] — Environment variable read by the auto Rust build to determine the `--target` triple.
 - **Arch-aware workspace** — Each arch gets its own workspace at `.ous/<pkg>/<arch>/` to avoid rebuild conflicts when building the same package for multiple architectures.
 - **Arch-specific index** — `index()` writes `index.<arch>.json` when the architecture is set, keeping per-arch metadata separate.

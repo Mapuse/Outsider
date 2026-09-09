@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 use crate::utils::ui::UserInterface;
+use crate::canonical_arch;
 
 /// Number of upload attempts before giving up.
 const MAX_ATTEMPTS: u32 = 4;
@@ -51,28 +52,20 @@ pub fn join_url(base_url: &str, rel: &str) -> String {
 /// Resolve the repository-relative layout for a published package, following
 /// the pool layout mcx consumes: `pool/<arch>/<name>/<name>-<ver>.xcs` plus
 /// its `.sha256` integrity sidecar.
-pub fn pool_paths(pkg_name: &str, pkg_version: &str, arch: &str) -> (String, String) {
-    let arch_dir = if arch.is_empty() || arch == "native" {
-        "native".to_string()
-    } else {
-        arch.to_string()
-    };
+pub fn pool_paths(pkg_name: &str, pkg_version: &str, arch: &str) -> Result<(String, String)> {
+    let arch_dir = canonical_arch(arch)?;
     let file = format!("{}-{}.xcs", pkg_name, pkg_version);
     let dir = format!("pool/{}/{}/", arch_dir, pkg_name);
     let archive = format!("{}{}", dir, file);
     let sidecar = format!("{}.sha256", archive);
-    (archive, sidecar)
+    Ok((archive, sidecar))
 }
 
 /// Index filename for an architecture (equal to the one clients fetch as
 /// `index.<arch>.json`).
-pub fn index_path(arch: &str) -> String {
-    let arch = if arch.is_empty() || arch == "native" {
-        "native"
-    } else {
-        arch
-    };
-    format!("index.{}.json", arch)
+pub fn index_path(arch: &str) -> Result<String> {
+    let arch = canonical_arch(arch)?;
+    Ok(format!("index.{}.json", arch))
 }
 
 /// Upload a single file with an HTTP PUT. Retries with exponential backoff
@@ -486,7 +479,7 @@ pub fn upload_package(
         ));
     }
 
-    let (rel_archive, rel_sidecar) = pool_paths(pkg_name, pkg_version, &opts.arch);
+    let (rel_archive, rel_sidecar) = pool_paths(pkg_name, pkg_version, &opts.arch)?;
     let sidecar_abs = {
         let mut os = archive_abs.as_os_str().to_os_string();
         os.push(".sha256");
@@ -521,7 +514,7 @@ pub fn upload_package(
     }
 
     if opts.upload_index {
-        let rel_index = index_path(&opts.arch);
+        let rel_index = index_path(&opts.arch)?;
         match index_source {
             Some(src) if src.exists() => {
                 let index_url = join_url(base_url, &rel_index);
@@ -563,23 +556,23 @@ mod tests {
 
     #[test]
     fn test_pool_paths_native_arch() {
-        let (archive, sidecar) = pool_paths("hello", "1.0.0", "native");
+        let (archive, sidecar) = pool_paths("hello", "1.0.0", "native").unwrap();
         assert_eq!(archive, "pool/native/hello/hello-1.0.0.xcs");
         assert_eq!(sidecar, "pool/native/hello/hello-1.0.0.xcs.sha256");
     }
 
     #[test]
     fn test_pool_paths_explicit_arch() {
-        let (archive, sidecar) = pool_paths("hello", "1.0.0", "aarch64");
+        let (archive, sidecar) = pool_paths("hello", "1.0.0", "aarch64").unwrap();
         assert_eq!(archive, "pool/aarch64/hello/hello-1.0.0.xcs");
         assert_eq!(sidecar, "pool/aarch64/hello/hello-1.0.0.xcs.sha256");
     }
 
     #[test]
     fn test_index_path_normalizes_arch() {
-        assert_eq!(index_path("native"), "index.native.json");
-        assert_eq!(index_path(""), "index.native.json");
-        assert_eq!(index_path("x86_64"), "index.x86_64.json");
+        assert_eq!(index_path("native").unwrap(), "index.native.json");
+        assert_eq!(index_path("").unwrap(), "index.native.json");
+        assert_eq!(index_path("x86_64").unwrap(), "index.x86_64.json");
     }
 
     #[test]

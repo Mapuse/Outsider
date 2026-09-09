@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use ous::utils::ui::UserInterface;
-use ous::{Manifest, PackageMetadata, process};
+use ous::{Manifest, PackageMetadata, canonical_arch, process};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -115,6 +115,15 @@ fn preprocess_argv(argv: &[String]) -> Vec<String> {
     let mut result = hoisted;
     result.extend(ordered);
     result
+}
+
+/// Resolve the repository-layout arch from a --arch flag / env var / default.
+fn resolve_repo_arch(opt_arch: &Option<String>) -> Result<String> {
+    let raw = opt_arch
+        .clone()
+        .or_else(|| env::var("CUDANE_TARGET").ok())
+        .unwrap_or_else(|| "native".to_string());
+    canonical_arch(&raw)
 }
 
 fn print_help() {
@@ -288,7 +297,7 @@ fn main() -> Result<()> {
                     }
                     "register" | "unregister" => not_supported("plugin", "p.desc"),
                     "run" => {
-                        ous::init_plugins(&cfg.python);
+                        ous::init_plugins(&cfg.python)?;
                         let name = take_value().unwrap_or_default();
                         let func = take_value().unwrap_or_default();
                         let rest: Vec<String> = args[idx..].to_vec();
@@ -314,7 +323,7 @@ fn main() -> Result<()> {
                         sys_process::exit(0);
                     }
                     "reload" => {
-                        ous::init_plugins(&cfg.python);
+                        ous::init_plugins(&cfg.python)?;
                         UserInterface::success("Plugins reloaded");
                         sys_process::exit(0);
                     }
@@ -557,9 +566,17 @@ fn main() -> Result<()> {
                     binaries: None,
                     sha256: None,
                 };
+                let prov = ous::build_provenance(&mock_pkg.source, &src_dir);
 
-                let metadata = match ous::mtd(&mock_pkg, &dest_dir, &sum, &src_dir, "", &repo_root)
-                {
+                let metadata = match ous::mtd(
+                    &mock_pkg,
+                    &dest_dir,
+                    &sum,
+                    &src_dir,
+                    "",
+                    &repo_root,
+                    Some(prov),
+                ) {
                     Ok(meta) => meta,
                     Err(e) => {
                         // Surface why metadata generation fell back to the skeleton.
@@ -584,6 +601,7 @@ fn main() -> Result<()> {
                             components: Vec::new(),
                             services: Vec::new(),
                             binaries: Vec::new(),
+                            provenance: Some(ous::build_provenance("manual", &src_dir)),
                         }
                     }
                 };
@@ -690,10 +708,7 @@ fn main() -> Result<()> {
                     UserInterface::error("Usage: ous --sort <dir> <arch>");
                     sys_process::exit(1);
                 }
-                let arch = opt_arch
-                    .clone()
-                    .or_else(|| env::var("CUDANE_TARGET").ok())
-                    .unwrap_or_else(|| "native".to_string());
+                let arch = resolve_repo_arch(&opt_arch)?;
                 ous::sort_packages(&dir, &arch)?;
                 sys_process::exit(0);
             }
@@ -720,10 +735,7 @@ fn main() -> Result<()> {
                     .clone()
                     .or_else(|| env::var("CUDANE_REPO_URL").ok())
                     .unwrap_or_else(|| "https://raw.codeberg.org/Cudane/Repository".to_string());
-                let arch = opt_arch
-                    .clone()
-                    .or_else(|| env::var("CUDANE_TARGET").ok())
-                    .unwrap_or_else(ous::config::schema::default_target_arch);
+                let arch = resolve_repo_arch(&opt_arch)?;
                 ous::checksum_index(&index_path, &pkg_dir, &base_url, &arch)?;
                 sys_process::exit(0);
             }
@@ -739,10 +751,7 @@ fn main() -> Result<()> {
                     .clone()
                     .or_else(|| env::var("CUDANE_REPO_URL").ok())
                     .unwrap_or_else(|| "https://raw.codeberg.org/Cudane/Repository".to_string());
-                let arch = opt_arch
-                    .clone()
-                    .or_else(|| env::var("CUDANE_TARGET").ok())
-                    .unwrap_or_else(ous::config::schema::default_target_arch);
+                let arch = resolve_repo_arch(&opt_arch)?;
                 ous::rewrite_source(&index_path, &base_url, &arch)?;
                 sys_process::exit(0);
             }

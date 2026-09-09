@@ -85,6 +85,25 @@ fn dir_non_empty(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Canonicalize a raw architecture string to mcx's canonical names:
+/// `amd64` → `x86_64`, `arm64` → `aarch64`, `x86_64`/`aarch64`/`native`
+/// pass through verbatim. Returns an error for any other value.
+pub fn canonical_arch(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok("native".to_string());
+    }
+    match trimmed {
+        "x86_64" | "aarch64" | "native" => Ok(trimmed.to_string()),
+        "amd64" => Ok("x86_64".to_string()),
+        "arm64" => Ok("aarch64".to_string()),
+        _ => Err(anyhow!(
+            "Unsupported architecture '{}': expected x86_64, aarch64, native, amd64, or arm64",
+            trimmed
+        )),
+    }
+}
+
 /// Parse a `<name>-<version>.xcs` filename, tolerating prerelease suffixes
 /// in the version (`1.0-beta`, `2.0.0-rc.1`). Returns `(name, version)`.
 pub fn parse_xcs_name(fname: &str) -> Option<(String, String)> {
@@ -161,18 +180,23 @@ fn version_sort_key(v: &str) -> Vec<(bool, u64, String)> {
 static PLUGIN_MANAGER: OnceLock<Mutex<cps::plugin::PluginManager>> = OnceLock::new();
 
 /// Load plugins declared under `[python].plugins` in ous.toml so pipeline
-/// hooks can fire into them. No-op without the `python` feature.
-pub fn init_plugins(cfg: &cps::PythonConfig) {
+/// hooks can fire into them. Returns Err when the `python` feature is not
+/// compiled in.
+pub fn init_plugins(cfg: &cps::PythonConfig) -> Result<()> {
     #[cfg(feature = "python")]
     {
         let mgr = PLUGIN_MANAGER.get_or_init(|| Mutex::new(cps::plugin::PluginManager::new()));
         if let Ok(mut m) = mgr.lock() {
             m.load_all(cfg);
         }
+        Ok(())
     }
     #[cfg(not(feature = "python"))]
     {
         let _ = cfg;
+        Err(anyhow!(
+            "The 'python' feature is required for --plugin run — compile with `cargo build --features python`"
+        ))
     }
 }
 
@@ -286,12 +310,21 @@ pub struct Checksum {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PackageProvenance {
+    pub source_type: String,
+    pub source_url: String,
+    pub source_revision: Option<String>,
+    pub built_at: String,
+    pub builder: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PackageMetadata {
     pub pkg_name: String,
     pub version: String,
     pub license: String,
     pub source: String,
-    #[serde(default)]
+    #[serde(alias = "arch", rename = "architecture", default)]
     pub arch: String,
     pub checksum: Checksum,
     pub dependencies: Vec<Dependency>,
@@ -304,6 +337,8 @@ pub struct PackageMetadata {
     pub services: Vec<ServiceDecl>,
     #[serde(default)]
     pub binaries: Vec<String>,
+    #[serde(default)]
+    pub provenance: Option<PackageProvenance>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1282,6 +1317,86 @@ fn transitive(
     }
 }
 
+/// Format a `SystemTime` as RFC 3339 UTC without external crates.
+fn iso8601_utc(st: std::time::SystemTime) -> String {
+    fn civil_from_days(z: i64) -> (i64, u32, u32) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+    let dur = st
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400) as u32;
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
+pub fn detect_source_type(source: &str) -> String {
+    if source.starts_with("git@")
+        || source.starts_with("git://")
+        || source.ends_with(".git")
+    {
+        "git".to_string()
+    } else if source.starts_with("https://") || source.starts_with("http://") {
+        "http".to_string()
+    } else if source.starts_with("file://") {
+        "file".to_string()
+    } else if source.contains("://") {
+        "url".to_string()
+    } else {
+        "dir".to_string()
+    }
+}
+
+/// Build a provenance record for a package at the given source directory.
+/// `source` is the original manifest source value. `src_dir` is the
+/// materialized source directory on disk (may be empty for manual builds).
+pub fn build_provenance(source: &str, src_dir: &str) -> PackageProvenance {
+    let source_type = detect_source_type(source);
+    let source_revision = if source_type == "git" && !src_dir.is_empty() {
+        Command::new("git")
+            .args(["-C", src_dir, "rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+            })
+    } else {
+        None
+    };
+    PackageProvenance {
+        source_type,
+        source_url: source.to_string(),
+        source_revision,
+        built_at: iso8601_utc(std::time::SystemTime::now()),
+        builder: format!("ous-{}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 pub fn mtd(
     pkg: &Package,
     dest: &str,
@@ -1289,6 +1404,7 @@ pub fn mtd(
     src_dir: &str,
     log_content: &str,
     repo_root: &Path,
+    provenance: Option<PackageProvenance>,
 ) -> Result<PackageMetadata> {
     let dependencies = scan(dest, src_dir, log_content, pkg, repo_root)?;
     let pkg_files = files(dest)?;
@@ -1351,6 +1467,7 @@ pub fn mtd(
         components,
         services,
         binaries,
+        provenance,
     })
 }
 
@@ -1468,24 +1585,23 @@ pub fn meta(
     log_content: &str,
 ) -> Result<()> {
     let repo_root = env::current_dir()?;
-    let meta = mtd(pkg, dest, sum, src_dir, log_content, &repo_root)?;
+    let prov = Some(build_provenance(&pkg.source, src_dir));
+    let meta = mtd(pkg, dest, sum, src_dir, log_content, &repo_root, prov)?;
     write(&meta, dest)
 }
 
 pub fn write(meta: &PackageMetadata, dest: &str) -> Result<()> {
     fs::create_dir_all(dest)?;
     let path = format!("{}/metadata.json", dest);
-    let json = serde_json::to_string_pretty(meta)?;
+    let mut out = meta.clone();
+    out.arch = canonical_arch(&out.arch)?;
+    let json = serde_json::to_string_pretty(&out)?;
     atomic_write(Path::new(&path), json.as_bytes())?;
     Ok(())
 }
 
 pub fn index(index_root: &str, meta: &PackageMetadata) -> Result<()> {
-    let arch = if meta.arch.is_empty() || meta.arch == "native" {
-        "native".to_string()
-    } else {
-        meta.arch.clone()
-    };
+    let arch = canonical_arch(&meta.arch)?;
     let index_path = Path::new(index_root).join(format!("index.{}.json", arch));
     fs::create_dir_all(index_root)?;
 
@@ -1626,9 +1742,12 @@ fn validate_path_component(value: &str, label: &str) -> Result<()> {
 }
 
 pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
+    let canonical = canonical_arch(&pkg.arch)?;
     validate_path_component(&pkg.name, "package name")?;
-    validate_path_component(&pkg.arch, "package arch")?;
+    validate_path_component(&canonical, "package arch")?;
     validate_version_component(&pkg.version, "package version")?;
+    let mut pkg = pkg.clone();
+    pkg.arch = canonical;
     UserInterface::info(&format!(
         "Processing package: {} v{}",
         pkg.name, pkg.version
@@ -1654,7 +1773,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
             "Package archive already exists at: {}",
             final_path
         ));
-        upload_step(pkg, &final_path, &current_dir)?;
+        upload_step(&pkg, &final_path, &current_dir)?;
         return Ok(final_path);
     }
 
@@ -1743,7 +1862,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
                     "Could not read persisted build log ({}); rerunning build",
                     e
                 ));
-                run_build_step(pkg, &src_str, &build_log_path, &mut state, &state_path)?
+                run_build_step(&pkg, &src_str, &build_log_path, &mut state, &state_path)?
             }
         }
     } else {
@@ -1752,7 +1871,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
                 "Resume marker says build is done but no build log found — rebuilding",
             );
         }
-        run_build_step(pkg, &src_str, &build_log_path, &mut state, &state_path)?
+        run_build_step(&pkg, &src_str, &build_log_path, &mut state, &state_path)?
     };
 
     if !(state.completed_steps.contains("install") && dir_non_empty(&pkg_root)) {
@@ -1763,7 +1882,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
         }
         UserInterface::info("Installing built files to root target...");
         fire_hook("pre-install", &pkg.name);
-        if let Err(e) = install(pkg, &src_str, &root_str) {
+        if let Err(e) = install(&pkg, &src_str, &root_str) {
             UserInterface::error(&format!("Install step failed: {}", e));
             return Err(anyhow!(e).context("Install step failed"));
         }
@@ -1795,13 +1914,15 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     if !state.completed_steps.contains("metadata") {
         UserInterface::info("Compiling dependency graph and manifest metadata...");
         fire_hook("pre-metadata", &pkg.name);
+        let prov = Some(build_provenance(&pkg.source, &src_str));
         let metadata = match mtd(
-            pkg,
+            &pkg,
             &root_str,
             &sum,
             &src_str,
             &build_log,
             current_dir.as_path(),
+            prov,
         ) {
             Ok(meta) => meta,
             Err(e) => {
@@ -1855,7 +1976,7 @@ pub fn process(pkg: &Package, out_dir: &str) -> Result<String> {
     }
 
     fire_hook("done", &pkg.name);
-    upload_step(pkg, &final_path, &current_dir)?;
+    upload_step(&pkg, &final_path, &current_dir)?;
     Ok(final_path)
 }
 
@@ -1869,18 +1990,14 @@ fn upload_step(pkg: &Package, final_path: &str, cwd: &Path) -> Result<()> {
     if base_url.trim().is_empty() {
         return Ok(());
     }
-    let arch = if pkg.arch.is_empty() {
-        "native".to_string()
-    } else {
-        pkg.arch.clone()
-    };
+    let arch = canonical_arch(&pkg.arch)?;
     let opts = crate::upload::UploadOptions {
         base_url: base_url.trim().to_string(),
         token: env::var("OUS_UPLOAD_TOKEN").ok(),
         arch: arch.clone(),
         upload_index: env::var("OUS_UPLOAD_INDEX").is_ok(),
     };
-    let index_source = cwd.join(crate::upload::index_path(&arch));
+    let index_source = cwd.join(crate::upload::index_path(&arch)?);
     let uploaded =
         crate::upload::upload_package(&opts, Path::new(final_path), &pkg.name, &pkg.version, Some(&index_source))?;
     UserInterface::success(&format!(
@@ -2572,6 +2689,438 @@ mod tests {
             .filter(|n| n.starts_with('.') && n.contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "leftover temp files: {:?}", leftovers);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_canonical_arch_mapping() {
+        assert_eq!(canonical_arch("x86_64").unwrap(), "x86_64");
+        assert_eq!(canonical_arch("aarch64").unwrap(), "aarch64");
+        assert_eq!(canonical_arch("native").unwrap(), "native");
+        assert_eq!(canonical_arch("amd64").unwrap(), "x86_64");
+        assert_eq!(canonical_arch("arm64").unwrap(), "aarch64");
+        assert_eq!(canonical_arch("").unwrap(), "native");
+        assert_eq!(canonical_arch("  x86_64  ").unwrap(), "x86_64");
+    }
+
+    #[test]
+    fn test_canonical_arch_rejects_unknown() {
+        assert!(canonical_arch("i686").is_err());
+        assert!(canonical_arch("riscv64").is_err());
+        assert!(canonical_arch("x86_64-unknown-linux-musl").is_err());
+        assert!(canonical_arch("arm").is_err());
+        let err = canonical_arch("powerpc64").unwrap_err().to_string();
+        assert!(err.contains("powerpc64"), "error must name the rejected value: {}", err);
+    }
+
+    #[test]
+    fn test_canonical_arch_used_in_index_metadata() {
+        let meta = PackageMetadata {
+            pkg_name: "test".into(),
+            version: "1.0".into(),
+            license: "MIT".into(),
+            source: "test".into(),
+            arch: "amd64".into(),
+            checksum: Checksum { kind: "sha256".into(), value: "abc".into() },
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            provides: None,
+            conflicts: None,
+            components: Vec::new(),
+            services: Vec::new(),
+            binaries: Vec::new(),
+            provenance: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"architecture\""), "must emit 'architecture' key, got: {}", json);
+        assert!(!json.contains("\"arch\""), "must NOT emit legacy 'arch' key, got: {}", json);
+    }
+
+    #[test]
+    fn test_canonical_arch_metadata_deserializes_legacy_key() {
+        let legacy_json = r#"{"pkg_name":"t","version":"1","license":"","source":"","arch":"arm64","checksum":{"kind":"sha256","value":""},"dependencies":[],"files":[]}"#;
+        let meta: PackageMetadata = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(meta.arch, "arm64");
+    }
+
+    #[test]
+    fn test_canonical_arch_metadata_roundtrip_new_key() {
+        let meta = PackageMetadata {
+            pkg_name: "t".into(),
+            version: "1".into(),
+            license: "".into(),
+            source: "".into(),
+            arch: "aarch64".into(),
+            checksum: Checksum { kind: "sha256".into(), value: "".into() },
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            provides: None,
+            conflicts: None,
+            components: Vec::new(),
+            services: Vec::new(),
+            binaries: Vec::new(),
+            provenance: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let deserialized: PackageMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, deserialized);
+        // Verify new key emitted
+        assert!(json.contains("\"architecture\""));
+    }
+
+    /// End-to-end archive round-trip: build a small tree, archive it, verify
+    /// zstd magic, extract, and confirm metadata.json has the "architecture"
+    /// key. Requires `tar` and `zstd` on PATH — ignored by default.
+    #[test]
+    #[ignore]
+    fn test_archive_roundtrip_metadata_architecture_key() {
+        let dir = test_dir("archive-rt");
+        let pkg_dir = dir.join("pkg");
+        let dest_dir = pkg_dir.join("usr").join("bin");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(dest_dir.join("hello"), b"hello").unwrap();
+        fs::write(pkg_dir.join("README"), b"readme").unwrap();
+
+        let metadata = PackageMetadata {
+            pkg_name: "roundtrip".into(),
+            version: "0.1".into(),
+            license: "MIT".into(),
+            source: "test".into(),
+            arch: "amd64".into(),
+            checksum: Checksum { kind: "sha256".into(), value: "deadbeef".into() },
+            dependencies: Vec::new(),
+            files: vec![PathBuf::from("usr/bin/hello"), PathBuf::from("README")],
+            provides: None,
+            conflicts: None,
+            components: Vec::new(),
+            services: Vec::new(),
+            binaries: Vec::new(),
+            provenance: None,
+        };
+        write(&metadata, pkg_dir.to_str().unwrap()).unwrap();
+
+        let xcs = dir.join("roundtrip-0.1.xcs");
+        archive(pkg_dir.to_str().unwrap(), xcs.to_str().unwrap()).unwrap();
+
+        // Verify zstd magic (4 bytes: 0x28 0xB5 0x2F 0xFD)
+        let mut header = [0u8; 4];
+        fs::File::open(&xcs).unwrap().read_exact(&mut header).unwrap();
+        assert_eq!(header, [0x28, 0xB5, 0x2F, 0xFD], "not a valid zstd stream");
+
+        // Extract into a fresh tree
+        let extract_dir = dir.join("extracted");
+        fs::create_dir_all(&extract_dir).unwrap();
+        let status = std::process::Command::new("tar")
+            .args(["--zstd", "-xf"])
+            .arg(&xcs)
+            .args(["-C", extract_dir.to_str().unwrap()])
+            .status()
+            .expect("tar must be available");
+        assert!(status.success(), "tar extraction failed");
+
+        // Original files present, metadata.json not expected by consumer
+        assert!(extract_dir.join("usr/bin/hello").exists());
+        assert!(extract_dir.join("README").exists());
+
+        // metadata.json must have "architecture" (not legacy "arch")
+        let meta_content = fs::read_to_string(extract_dir.join("metadata.json")).unwrap();
+        assert!(
+            meta_content.contains("\"architecture\""),
+            "metadata.json must use 'architecture' key: {}",
+            meta_content
+        );
+        assert!(
+            !meta_content.contains("\"arch\":"),
+            "metadata.json must not use legacy 'arch' key: {}",
+            meta_content
+        );
+
+        // Verify the architecture value was canonicalized from amd64 -> x86_64
+        let parsed: serde_json::Value = serde_json::from_str(&meta_content).unwrap();
+        assert_eq!(
+            parsed["architecture"].as_str(),
+            Some("x86_64"),
+            "amd64 must be canonicalized to x86_64"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_detect_source_type_variants() {
+        assert_eq!(detect_source_type("/tmp/some/local/dir"), "dir");
+        assert_eq!(detect_source_type(""), "dir");
+        assert_eq!(detect_source_type("https://example.com/foo.tar.gz"), "http");
+        assert_eq!(detect_source_type("http://example.com/foo"), "http");
+        assert_eq!(detect_source_type("file:///tmp/foo.tar.xz"), "file");
+        assert_eq!(detect_source_type("git@github.com:org/repo.git"), "git");
+        assert_eq!(detect_source_type("git://example.com/repo.git"), "git");
+        assert_eq!(detect_source_type("https://example.com/repo.git"), "git");
+        assert_eq!(detect_source_type("s3://bucket/object"), "url");
+    }
+
+    #[test]
+    fn test_build_provenance_source_types() {
+        let dir = test_dir("prov-src");
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let prov = build_provenance(&dir_str, &dir_str);
+        assert_eq!(prov.source_type, "dir");
+        assert_eq!(prov.source_url, dir_str);
+        assert!(prov.source_revision.is_none(), "dir sources must have no revision");
+        assert!(!prov.built_at.is_empty(), "built_at must be non-empty");
+        assert_eq!(prov.builder, "ous-0.7.0");
+
+        let prov = build_provenance("https://example.com/foo.tar.gz", &dir_str);
+        assert_eq!(prov.source_type, "http");
+        assert_eq!(prov.source_url, "https://example.com/foo.tar.gz");
+        assert!(prov.source_revision.is_none(), "http sources must have no revision");
+        assert!(!prov.built_at.is_empty());
+        assert_eq!(prov.builder, "ous-0.7.0");
+
+        let prov = build_provenance("file:///tmp/foo.tar.xz", &dir_str);
+        assert_eq!(prov.source_type, "file");
+        assert!(prov.source_revision.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_git_provenance_revision() {
+        let git_check = Command::new("git").arg("--version").output();
+        if git_check.is_err() {
+            eprintln!("git unavailable; skipping");
+            return;
+        }
+        let repo = test_dir("prov-git");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+        fs::write(repo.join("README"), b"hi").unwrap();
+        Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        let commit = Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["commit", "-qm", "init", "--allow-empty"])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {}", String::from_utf8_lossy(&commit.stderr));
+
+        let repo_str = repo.to_str().unwrap().to_string();
+        let prov = build_provenance(&repo_str, &repo_str);
+        assert_eq!(prov.source_type, "dir");
+        assert!(prov.source_revision.is_none(), "local dir sources never carry a revision");
+
+        // A git URL with the materialized dir still yields the revision.
+        let prov = build_provenance("https://example.com/repo.git", &repo_str);
+        assert_eq!(prov.source_type, "git");
+        assert!(prov.source_revision.is_some());
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn test_provenance_written_via_metadata_write_path() {
+        let src = test_dir("prov-src");
+        let dest = test_dir("prov-dest");
+        let repo = test_dir("prov-repo");
+        fs::write(src.join("Makefile"), b"all:\n").unwrap();
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::write(dest.join("usr/bin/hello"), b"hello").unwrap();
+
+        let pkg = Package {
+            name: "prov-pkg".into(),
+            version: "1.0".into(),
+            source: src.to_str().unwrap().to_string(),
+            build_type: "manual".into(),
+            build: Vec::new(),
+            install: Vec::new(),
+            dependencies: None,
+            links: None,
+            arch: "native".into(),
+            components: None,
+            services: None,
+            binaries: None,
+            sha256: None,
+        };
+        let sum = vec![Checksum { kind: "sha256".into(), value: "abc123".into() }];
+        let prov = build_provenance(&pkg.source, src.to_str().unwrap());
+        let meta = mtd(
+            &pkg,
+            dest.to_str().unwrap(),
+            &sum,
+            src.to_str().unwrap(),
+            "",
+            &repo,
+            Some(prov),
+        )
+        .unwrap();
+        write(&meta, dest.to_str().unwrap()).unwrap();
+
+        let content = fs::read_to_string(dest.join("metadata.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let prov = &value["provenance"];
+        assert_eq!(prov["source_type"], "dir");
+        assert_eq!(prov["source_url"], pkg.source);
+        assert!(prov["source_revision"].is_null(), "dir sources must emit null revision");
+        assert!(!prov["built_at"].as_str().unwrap_or_default().is_empty());
+        assert_eq!(prov["builder"], "ous-0.7.0");
+
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn test_legacy_metadata_without_provenance_deserializes() {
+        let legacy = r#"{
+            "pkg_name": "legacy",
+            "version": "1.0",
+            "license": "MIT",
+            "source": "old",
+            "architecture": "x86_64",
+            "checksum": {"kind": "sha256", "value": "abc"},
+            "dependencies": [],
+            "files": [],
+            "provides": null,
+            "conflicts": null,
+            "components": [],
+            "services": [],
+            "binaries": []
+        }"#;
+        let meta: PackageMetadata = serde_json::from_str(legacy).unwrap();
+        assert!(meta.provenance.is_none(), "missing provenance must deserialize to None");
+
+        let with = PackageMetadata {
+            pkg_name: "t".into(),
+            version: "1".into(),
+            license: "".into(),
+            source: "".into(),
+            arch: "native".into(),
+            checksum: Checksum { kind: "sha256".into(), value: "".into() },
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            provides: None,
+            conflicts: None,
+            components: Vec::new(),
+            services: Vec::new(),
+            binaries: Vec::new(),
+            provenance: Some(PackageProvenance {
+                source_type: "dir".into(),
+                source_url: "/tmp/x".into(),
+                source_revision: None,
+                built_at: "2026-01-01T00:00:00Z".into(),
+                builder: "ous-0.7.0".into(),
+            }),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        let back: PackageMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with);
+        assert!(json.contains("\"provenance\""));
+    }
+
+    #[test]
+    fn test_provenance_survives_source_rewrite() {
+        let repo = test_dir("prov-rewrite");
+        let index_path = repo.join("index.json");
+        let meta = PackageMetadata {
+            pkg_name: "rew".into(),
+            version: "1.0".into(),
+            license: "MIT".into(),
+            source: "https://example.com/original.tar.gz".into(),
+            arch: "x86_64".into(),
+            checksum: Checksum { kind: "sha256".into(), value: "abc".into() },
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            provides: None,
+            conflicts: None,
+            components: Vec::new(),
+            services: Vec::new(),
+            binaries: Vec::new(),
+            provenance: Some(PackageProvenance {
+                source_type: "http".into(),
+                source_url: "https://example.com/original.tar.gz".into(),
+                source_revision: None,
+                built_at: "2026-01-01T00:00:00Z".into(),
+                builder: "ous-0.7.0".into(),
+            }),
+        };
+        fs::write(&index_path, serde_json::to_string_pretty(&[meta]).unwrap()).unwrap();
+        unsafe { env::set_var("OUS_ASSUME_YES", "1") };
+        rewrite_source(
+            index_path.to_str().unwrap(),
+            "https://repo.example",
+            "x86_64",
+        )
+        .unwrap();
+        unsafe { env::remove_var("OUS_ASSUME_YES") };
+
+        let reindex: Vec<PackageMetadata> =
+            serde_json::from_str(&fs::read_to_string(&index_path).unwrap()).unwrap();
+        assert!(reindex[0].source.starts_with("https://repo.example/pool/"));
+        let prov = reindex[0].provenance.as_ref().unwrap();
+        assert_eq!(prov.source_url, "https://example.com/original.tar.gz");
+        assert_eq!(prov.source_type, "http");
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// End-to-end: the archive's embedded metadata.json carries the provenance
+    /// block. Requires `tar` and `zstd` on PATH — ignored by default.
+    #[test]
+    #[ignore]
+    fn test_provenance_embedded_in_archive_metadata() {
+        let dir = test_dir("prov-arch");
+        let pkg_dir = dir.join("pkg");
+        fs::create_dir_all(pkg_dir.join("usr/bin")).unwrap();
+        fs::write(pkg_dir.join("usr/bin/hello"), b"hello").unwrap();
+
+        let metadata = PackageMetadata {
+            pkg_name: "provarch".into(),
+            version: "0.1".into(),
+            license: "MIT".into(),
+            source: "https://example.com/hello.tar.gz".into(),
+            arch: "native".into(),
+            checksum: Checksum { kind: "sha256".into(), value: "deadbeef".into() },
+            dependencies: Vec::new(),
+            files: vec![PathBuf::from("usr/bin/hello")],
+            provides: None,
+            conflicts: None,
+            components: Vec::new(),
+            services: Vec::new(),
+            binaries: Vec::new(),
+            provenance: Some(build_provenance("https://example.com/hello.tar.gz", "")),
+        };
+        write(&metadata, pkg_dir.to_str().unwrap()).unwrap();
+
+        let xcs = dir.join("provarch-0.1.xcs");
+        archive(pkg_dir.to_str().unwrap(), xcs.to_str().unwrap()).unwrap();
+
+        let extract_dir = dir.join("extracted");
+        fs::create_dir_all(&extract_dir).unwrap();
+        let status = std::process::Command::new("tar")
+            .args(["--zstd", "-xf"])
+            .arg(&xcs)
+            .args(["-C", extract_dir.to_str().unwrap()])
+            .status()
+            .expect("tar must be available");
+        assert!(status.success(), "tar extraction failed");
+
+        let content = fs::read_to_string(extract_dir.join("metadata.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["provenance"]["source_type"], "http");
+        assert_eq!(value["provenance"]["source_url"], "https://example.com/hello.tar.gz");
+        assert!(!value["provenance"]["built_at"].as_str().unwrap_or_default().is_empty());
+        assert_eq!(value["provenance"]["builder"], "ous-0.7.0");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

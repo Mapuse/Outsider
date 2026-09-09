@@ -660,7 +660,11 @@ fn build_command_marker(dir: &str, index: usize, cmd: &str) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(cmd.as_bytes());
     let digest = hasher.finalize();
-    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).take(16).collect();
+    let hex: String = digest
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .take(16)
+        .collect();
     Path::new(dir)
         .join(".ous-build")
         .join(format!("cmd-{}-{}.done", index + 1, hex))
@@ -1331,9 +1335,7 @@ fn iso8601_utc(st: std::time::SystemTime) -> String {
         let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
         (if m <= 2 { y + 1 } else { y }, m, d)
     }
-    let dur = st
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let dur = st.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let secs = dur.as_secs() as i64;
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400) as u32;
@@ -1350,10 +1352,7 @@ fn iso8601_utc(st: std::time::SystemTime) -> String {
 }
 
 pub fn detect_source_type(source: &str) -> String {
-    if source.starts_with("git@")
-        || source.starts_with("git://")
-        || source.ends_with(".git")
-    {
+    if source.starts_with("git@") || source.starts_with("git://") || source.ends_with(".git") {
         "git".to_string()
     } else if source.starts_with("https://") || source.starts_with("http://") {
         "http".to_string()
@@ -1998,8 +1997,13 @@ fn upload_step(pkg: &Package, final_path: &str, cwd: &Path) -> Result<()> {
         upload_index: env::var("OUS_UPLOAD_INDEX").is_ok(),
     };
     let index_source = cwd.join(crate::upload::index_path(&arch)?);
-    let uploaded =
-        crate::upload::upload_package(&opts, Path::new(final_path), &pkg.name, &pkg.version, Some(&index_source))?;
+    let uploaded = crate::upload::upload_package(
+        &opts,
+        Path::new(final_path),
+        &pkg.name,
+        &pkg.version,
+        Some(&index_source),
+    )?;
     UserInterface::success(&format!(
         "Published {} v{} — {} file(s) uploaded",
         pkg.name,
@@ -2710,7 +2714,11 @@ mod tests {
         assert!(canonical_arch("x86_64-unknown-linux-musl").is_err());
         assert!(canonical_arch("arm").is_err());
         let err = canonical_arch("powerpc64").unwrap_err().to_string();
-        assert!(err.contains("powerpc64"), "error must name the rejected value: {}", err);
+        assert!(
+            err.contains("powerpc64"),
+            "error must name the rejected value: {}",
+            err
+        );
     }
 
     #[test]
@@ -2721,7 +2729,10 @@ mod tests {
             license: "MIT".into(),
             source: "test".into(),
             arch: "amd64".into(),
-            checksum: Checksum { kind: "sha256".into(), value: "abc".into() },
+            checksum: Checksum {
+                kind: "sha256".into(),
+                value: "abc".into(),
+            },
             dependencies: Vec::new(),
             files: Vec::new(),
             provides: None,
@@ -2732,8 +2743,16 @@ mod tests {
             provenance: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
-        assert!(json.contains("\"architecture\""), "must emit 'architecture' key, got: {}", json);
-        assert!(!json.contains("\"arch\""), "must NOT emit legacy 'arch' key, got: {}", json);
+        assert!(
+            json.contains("\"architecture\""),
+            "must emit 'architecture' key, got: {}",
+            json
+        );
+        assert!(
+            !json.contains("\"arch\""),
+            "must NOT emit legacy 'arch' key, got: {}",
+            json
+        );
     }
 
     #[test]
@@ -2751,7 +2770,10 @@ mod tests {
             license: "".into(),
             source: "".into(),
             arch: "aarch64".into(),
-            checksum: Checksum { kind: "sha256".into(), value: "".into() },
+            checksum: Checksum {
+                kind: "sha256".into(),
+                value: "".into(),
+            },
             dependencies: Vec::new(),
             files: Vec::new(),
             provides: None,
@@ -2787,7 +2809,10 @@ mod tests {
             license: "MIT".into(),
             source: "test".into(),
             arch: "amd64".into(),
-            checksum: Checksum { kind: "sha256".into(), value: "deadbeef".into() },
+            checksum: Checksum {
+                kind: "sha256".into(),
+                value: "deadbeef".into(),
+            },
             dependencies: Vec::new(),
             files: vec![PathBuf::from("usr/bin/hello"), PathBuf::from("README")],
             provides: None,
@@ -2804,7 +2829,10 @@ mod tests {
 
         // Verify zstd magic (4 bytes: 0x28 0xB5 0x2F 0xFD)
         let mut header = [0u8; 4];
-        fs::File::open(&xcs).unwrap().read_exact(&mut header).unwrap();
+        fs::File::open(&xcs)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
         assert_eq!(header, [0x28, 0xB5, 0x2F, 0xFD], "not a valid zstd stream");
 
         // Extract into a fresh tree
@@ -2867,14 +2895,20 @@ mod tests {
         let prov = build_provenance(&dir_str, &dir_str);
         assert_eq!(prov.source_type, "dir");
         assert_eq!(prov.source_url, dir_str);
-        assert!(prov.source_revision.is_none(), "dir sources must have no revision");
+        assert!(
+            prov.source_revision.is_none(),
+            "dir sources must have no revision"
+        );
         assert!(!prov.built_at.is_empty(), "built_at must be non-empty");
         assert_eq!(prov.builder, "ous-0.7.0");
 
         let prov = build_provenance("https://example.com/foo.tar.gz", &dir_str);
         assert_eq!(prov.source_type, "http");
         assert_eq!(prov.source_url, "https://example.com/foo.tar.gz");
-        assert!(prov.source_revision.is_none(), "http sources must have no revision");
+        assert!(
+            prov.source_revision.is_none(),
+            "http sources must have no revision"
+        );
         assert!(!prov.built_at.is_empty());
         assert_eq!(prov.builder, "ous-0.7.0");
 
@@ -2912,12 +2946,19 @@ mod tests {
             .args(["commit", "-qm", "init", "--allow-empty"])
             .output()
             .unwrap();
-        assert!(commit.status.success(), "git commit failed: {}", String::from_utf8_lossy(&commit.stderr));
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
 
         let repo_str = repo.to_str().unwrap().to_string();
         let prov = build_provenance(&repo_str, &repo_str);
         assert_eq!(prov.source_type, "dir");
-        assert!(prov.source_revision.is_none(), "local dir sources never carry a revision");
+        assert!(
+            prov.source_revision.is_none(),
+            "local dir sources never carry a revision"
+        );
 
         // A git URL with the materialized dir still yields the revision.
         let prov = build_provenance("https://example.com/repo.git", &repo_str);
@@ -2951,7 +2992,10 @@ mod tests {
             binaries: None,
             sha256: None,
         };
-        let sum = vec![Checksum { kind: "sha256".into(), value: "abc123".into() }];
+        let sum = vec![Checksum {
+            kind: "sha256".into(),
+            value: "abc123".into(),
+        }];
         let prov = build_provenance(&pkg.source, src.to_str().unwrap());
         let meta = mtd(
             &pkg,
@@ -2970,7 +3014,10 @@ mod tests {
         let prov = &value["provenance"];
         assert_eq!(prov["source_type"], "dir");
         assert_eq!(prov["source_url"], pkg.source);
-        assert!(prov["source_revision"].is_null(), "dir sources must emit null revision");
+        assert!(
+            prov["source_revision"].is_null(),
+            "dir sources must emit null revision"
+        );
         assert!(!prov["built_at"].as_str().unwrap_or_default().is_empty());
         assert_eq!(prov["builder"], "ous-0.7.0");
 
@@ -2997,7 +3044,10 @@ mod tests {
             "binaries": []
         }"#;
         let meta: PackageMetadata = serde_json::from_str(legacy).unwrap();
-        assert!(meta.provenance.is_none(), "missing provenance must deserialize to None");
+        assert!(
+            meta.provenance.is_none(),
+            "missing provenance must deserialize to None"
+        );
 
         let with = PackageMetadata {
             pkg_name: "t".into(),
@@ -3005,7 +3055,10 @@ mod tests {
             license: "".into(),
             source: "".into(),
             arch: "native".into(),
-            checksum: Checksum { kind: "sha256".into(), value: "".into() },
+            checksum: Checksum {
+                kind: "sha256".into(),
+                value: "".into(),
+            },
             dependencies: Vec::new(),
             files: Vec::new(),
             provides: None,
@@ -3037,7 +3090,10 @@ mod tests {
             license: "MIT".into(),
             source: "https://example.com/original.tar.gz".into(),
             arch: "x86_64".into(),
-            checksum: Checksum { kind: "sha256".into(), value: "abc".into() },
+            checksum: Checksum {
+                kind: "sha256".into(),
+                value: "abc".into(),
+            },
             dependencies: Vec::new(),
             files: Vec::new(),
             provides: None,
@@ -3089,7 +3145,10 @@ mod tests {
             license: "MIT".into(),
             source: "https://example.com/hello.tar.gz".into(),
             arch: "native".into(),
-            checksum: Checksum { kind: "sha256".into(), value: "deadbeef".into() },
+            checksum: Checksum {
+                kind: "sha256".into(),
+                value: "deadbeef".into(),
+            },
             dependencies: Vec::new(),
             files: vec![PathBuf::from("usr/bin/hello")],
             provides: None,
@@ -3117,8 +3176,16 @@ mod tests {
         let content = fs::read_to_string(extract_dir.join("metadata.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(value["provenance"]["source_type"], "http");
-        assert_eq!(value["provenance"]["source_url"], "https://example.com/hello.tar.gz");
-        assert!(!value["provenance"]["built_at"].as_str().unwrap_or_default().is_empty());
+        assert_eq!(
+            value["provenance"]["source_url"],
+            "https://example.com/hello.tar.gz"
+        );
+        assert!(
+            !value["provenance"]["built_at"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
         assert_eq!(value["provenance"]["builder"], "ous-0.7.0");
 
         let _ = fs::remove_dir_all(&dir);

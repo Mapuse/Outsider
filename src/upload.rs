@@ -1,3 +1,5 @@
+use crate::canonical_arch;
+use crate::utils::ui::UserInterface;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -5,8 +7,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
-use crate::utils::ui::UserInterface;
-use crate::canonical_arch;
 
 /// Number of upload attempts before giving up.
 const MAX_ATTEMPTS: u32 = 4;
@@ -81,7 +81,9 @@ pub fn upload_file(url: &str, file: &Path, token: Option<&str>) -> Result<()> {
             Ok(()) => {
                 UserInterface::info(&format!(
                     "Uploaded {} ({:.2} MiB) -> {}",
-                    file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    file.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     size as f64 / 1024.0 / 1024.0,
                     url
                 ));
@@ -125,7 +127,9 @@ fn try_upload(url: &str, file: &Path, token: Option<&str>) -> Result<()> {
     }
     cmd.arg(url);
 
-    let out = cmd.output().map_err(|e| anyhow!("Failed to spawn curl: {}", e))?;
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow!("Failed to spawn curl: {}", e))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -138,7 +142,11 @@ fn try_upload(url: &str, file: &Path, token: Option<&str>) -> Result<()> {
             "HTTP PUT {} exited with {}: {}",
             url,
             out.status,
-            if detail.is_empty() { "no detail" } else { &detail }
+            if detail.is_empty() {
+                "no detail"
+            } else {
+                &detail
+            }
         ));
     }
     Ok(())
@@ -214,7 +222,9 @@ pub fn upload_file_resumable(url: &str, file: &Path, token: Option<&str>) -> Res
     {
         UserInterface::info(&format!(
             "{} already present at {} — skipping",
-            file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            file.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             url
         ));
         return Ok(());
@@ -280,7 +290,9 @@ pub fn upload_file_resumable(url: &str, file: &Path, token: Option<&str>) -> Res
 
     UserInterface::info(&format!(
         "Uploaded {} ({:.2} MiB, {} chunks) -> {}",
-        file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        file.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         size as f64 / 1024.0 / 1024.0,
         chunk_ranges(size, RESUME_CHUNK_SIZE).len(),
         url
@@ -297,11 +309,15 @@ fn head_content_length(url: &str, token: Option<&str>) -> Option<u64> {
     let mut cmd = Command::new("curl");
     cmd.arg("--silent")
         .arg("--show-error")
-        .arg("--request").arg("HEAD")
-        .arg("--dump-header").arg("-")
-        .arg("--output").arg("/dev/null");
+        .arg("--request")
+        .arg("HEAD")
+        .arg("--dump-header")
+        .arg("-")
+        .arg("--output")
+        .arg("/dev/null");
     if let Some(token) = token.filter(|t| !t.trim().is_empty()) {
-        cmd.arg("--header").arg(format!("Authorization: Bearer {}", token.trim()));
+        cmd.arg("--header")
+            .arg(format!("Authorization: Bearer {}", token.trim()));
     }
     cmd.arg(url);
     let out = cmd.output().ok()?;
@@ -385,39 +401,58 @@ fn put_range(
     token: Option<&str>,
 ) -> Result<Option<u16>> {
     let mut child = Command::new("curl");
-    child.arg("--fail")
+    child
+        .arg("--fail")
         .arg("--silent")
         .arg("--show-error")
-        .arg("--request").arg("PUT")
-        .arg("--header").arg("Content-Type: application/octet-stream")
+        .arg("--request")
+        .arg("PUT")
+        .arg("--header")
+        .arg("Content-Type: application/octet-stream")
         .arg("--header")
         .arg(format!("Content-Range: bytes {}-{}/{}", start, end, total))
-        .arg("--write-out").arg("\n%{http_code}")
-        .arg("--output").arg("/dev/null")
-        .arg("--upload-file").arg("-");
+        .arg("--write-out")
+        .arg("\n%{http_code}")
+        .arg("--output")
+        .arg("/dev/null")
+        .arg("--upload-file")
+        .arg("-");
     if let Some(token) = token.filter(|t| !t.trim().is_empty()) {
-        child.arg("--header").arg(format!("Authorization: Bearer {}", token.trim()));
+        child
+            .arg("--header")
+            .arg(format!("Authorization: Bearer {}", token.trim()));
     }
     child.arg(url);
     child.stdin(Stdio::piped()).stdout(Stdio::piped());
 
-    let mut child = child.spawn().map_err(|e| anyhow!("Failed to spawn curl: {}", e))?;
+    let mut child = child
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn curl: {}", e))?;
     if let Some(mut stdin) = child.stdin.take() {
         let mut remaining = len;
         let mut buf = [0u8; 64 * 1024];
         while remaining > 0 {
             let want = (remaining.min(buf.len() as u64)) as usize;
-            let n = reader.read(&mut buf[..want]).map_err(|e| anyhow!("Failed to read chunk: {}", e))?;
+            let n = reader
+                .read(&mut buf[..want])
+                .map_err(|e| anyhow!("Failed to read chunk: {}", e))?;
             if n == 0 {
-                return Err(anyhow!("File shrank while uploading: expected {} more bytes", remaining));
+                return Err(anyhow!(
+                    "File shrank while uploading: expected {} more bytes",
+                    remaining
+                ));
             }
-            stdin.write_all(&buf[..n]).map_err(|e| anyhow!("Failed to pipe chunk to curl: {}", e))?;
+            stdin
+                .write_all(&buf[..n])
+                .map_err(|e| anyhow!("Failed to pipe chunk to curl: {}", e))?;
             remaining -= n as u64;
         }
         drop(stdin);
     }
 
-    let out = child.wait_with_output().map_err(|e| anyhow!("Failed to wait for curl: {}", e))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| anyhow!("Failed to wait for curl: {}", e))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let detail = if stderr.trim().is_empty() {
@@ -432,7 +467,11 @@ fn put_range(
             end,
             total,
             out.status,
-            if detail.is_empty() { "no detail" } else { &detail }
+            if detail.is_empty() {
+                "no detail"
+            } else {
+                &detail
+            }
         ));
     }
 
@@ -548,10 +587,14 @@ mod tests {
 
     #[test]
     fn test_join_url_slash_tolerance() {
-        assert_eq!(join_url("https://repo.example.org", "pool/x/foo-1.xcs"),
-                   "https://repo.example.org/pool/x/foo-1.xcs");
-        assert_eq!(join_url("https://repo.example.org/", "/pool/x/foo"),
-                   "https://repo.example.org/pool/x/foo");
+        assert_eq!(
+            join_url("https://repo.example.org", "pool/x/foo-1.xcs"),
+            "https://repo.example.org/pool/x/foo-1.xcs"
+        );
+        assert_eq!(
+            join_url("https://repo.example.org/", "/pool/x/foo"),
+            "https://repo.example.org/pool/x/foo"
+        );
     }
 
     #[test]
@@ -577,10 +620,7 @@ mod tests {
 
     #[test]
     fn test_chunk_ranges_resume_layout() {
-        assert_eq!(
-            chunk_ranges(17, 8),
-            vec![(0, 8), (8, 16), (16, 17)]
-        );
+        assert_eq!(chunk_ranges(17, 8), vec![(0, 8), (8, 16), (16, 17)]);
         assert_eq!(chunk_ranges(16, 8), vec![(0, 8), (8, 16)]);
         assert!(chunk_ranges(0, 8).is_empty());
         let ranges = chunk_ranges(25_000_000, 8 * 1024 * 1024);
@@ -629,7 +669,11 @@ mod tests {
         state.size = 999;
         save_state(&sidecar, &state).unwrap();
         let stale = load_state(&sidecar, "https://r.example/pool/x/hello-1.0.0.xcs").unwrap();
-        assert_ne!(stale.size, std::fs::metadata(&archive).unwrap().len(), "stale size must not match");
+        assert_ne!(
+            stale.size,
+            std::fs::metadata(&archive).unwrap().len(),
+            "stale size must not match"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -70,8 +70,8 @@ fn value_flag_arity(flag: &str) -> Option<usize> {
     Some(match flag {
         "-a" | "--archive" | "-x" | "--extract" | "-w" | "--write" => 2,
         "-i" | "--inspect" | "-m" | "--manifest" | "-o" | "--output" | "-j" | "--jobs" | "-z"
-        | "--zstd-level" | "-p" | "--project" | "-t" | "--target" | "-b" | "--hash-type"
-        | "-u" | "--upload" | "--token" | "--sort" | "--validate" | "--checksum" | "--sign"
+        | "--zstd-level" | "-p" | "--project" | "-t" | "--target" | "-b" | "--hash-type" | "-u"
+        | "--upload" | "--token" | "--sort" | "--validate" | "--checksum" | "--sign"
         | "--source" | "--plugin" | "--theme" | "--tui" | "--base-url" | "--arch" | "--key" => 1,
         _ => return None,
     })

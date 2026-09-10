@@ -2933,6 +2933,18 @@ mod tests {
             .output()
             .unwrap();
         assert!(init.status.success(), "git init failed");
+        Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["config", "user.name", "Cudane Tests"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["-C"])
+            .arg(&repo)
+            .args(["config", "user.email", "tests@cudane.local"])
+            .output()
+            .unwrap();
         fs::write(repo.join("README"), b"hi").unwrap();
         Command::new("git")
             .args(["-C"])

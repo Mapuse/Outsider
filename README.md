@@ -1953,18 +1953,25 @@ All build systems auto-detect `x86_64`/`aarch64` and select the correct musl tar
 ### Cargo (direct)
 
 ```shell
-cargo build --release
-# Binary: target/release/ous
-# Install:
-install -Dm755 target/release/ous /system/bin/ous
+TRIPLE=x86_64-unknown-linux-musl     # or aarch64-unknown-linux-musl
+PREFIX=/system
+DESTDIR=                             # empty = install into $PREFIX
+
+cargo build --release --locked --target $TRIPLE
+# Binary: target/$TRIPLE/release/ous
+install -Dm755 target/$TRIPLE/release/ous $DESTDIR$PREFIX/bin/ous
 ```
 
 ### Make
 
 ```shell
+TRIPLE=x86_64-unknown-linux-musl     # or aarch64-unknown-linux-musl
+PREFIX=/system
+DESTDIR=
+
 make build                    # auto-detects arch, builds for host
-make install                  # installs to /system/bin/ous
-make install DESTDIR=/mnt     # staged install
+make install DESTDIR=$DESTDIR PREFIX=$PREFIX
+make install DESTDIR=/mnt PREFIX=$PREFIX     # staged install
 ```
 
 ### Meson
@@ -2027,11 +2034,54 @@ cargo test -- test_name
 cargo test --release --all-features
 ```
 
+### Two-target gate (local)
+
+The CI gate runs on both `amd64` (`ubuntu-latest`) and `arm64` (`ubuntu-24.04-arm`) — native on each runner, no qemu in CI. To reproduce the full gate locally:
+
+**amd64** (native, matches the CI ubuntu-latest leg):
+
+```shell
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo build --locked
+cargo test --locked
+```
+
+**aarch64** cross (from an amd64 host):
+
+```shell
+export CC_aarch64_unknown_linux_musl=$PWD/toolchains/zig-aarch64-musl-cc
+export AR_aarch64_unknown_linux_musl=/usr/bin/ar
+cargo test --locked --target aarch64-unknown-linux-musl
+```
+
+Test binaries execute through qemu-user/binfmt. CI runs the same leg natively on `ubuntu-24.04-arm`.
+
+**amd64** cross (from an arm64 host):
+
+```shell
+export CC_x86_64_unknown_linux_musl=$PWD/toolchains/zig-x86_64-musl-cc
+export AR_x86_64_unknown_linux_musl=/usr/bin/ar
+cargo test --locked --target x86_64-unknown-linux-musl
+```
+
+The x86_64 test binaries execute through qemu-user/binfmt on an arm64 host. CI runs the same leg natively on `ubuntu-latest`.
+
+**Git-identity CI simulation:**
+
+The test suite includes a git-provenance integration test that performs `git commit`. GitHub Actions runners have no git identity, so the test sets a repo-local `user.name`/`user.email`. To reproduce the identity-less environment locally:
+
+```shell
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test --locked
+```
+
+> **Note:** Do not set `HOME` — it breaks rustup toolchain resolution.
+
 ## Linting
 
 ```shell
 # Clippy (lint checks)
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 
 # Format check
 cargo fmt --check
@@ -2084,9 +2134,16 @@ perf stat -e cycles,instructions,cache-misses,faults ./target/release/ous
 
 ## Continuous integration
 
-CI runs via GitHub Actions (`.github/workflows/rust.yml`) on every push/PR to `master`, on both `amd64` (`ubuntu-latest`) and `arm64` (`ubuntu-24.04-arm`) runners. Each job runs, in order:
+CI runs via GitHub Actions (`.github/workflows/rust.yml`) on every push/PR to `master`, on both `amd64` (`ubuntu-latest`) and `arm64` (`ubuntu-24.04-arm`) runners. The matrix runs the same steps on each:
 
 ```yaml
+matrix:
+  include:
+    - arch: amd64
+      os: ubuntu-latest
+    - arch: arm64
+      os: ubuntu-24.04-arm
+
 steps:
   - name: Check formatting
     run: cargo fmt --check
